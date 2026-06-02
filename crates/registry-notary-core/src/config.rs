@@ -322,6 +322,15 @@ impl StandaloneRegistryNotaryConfig {
         if signing.token_typ.trim().is_empty() {
             return invalid_access_token_signing("token_typ must not be empty when enabled");
         }
+        // The access-token `typ` must differ from the pre-authorized-code `typ`,
+        // or a pre-authorized code would also verify as an access token (the two
+        // are distinguished only by header `typ`).
+        if signing.token_typ == crate::tokens::PRE_AUTHORIZED_CODE_JWT_TYP {
+            return invalid_access_token_signing(format!(
+                "token_typ must not equal the pre-authorized-code typ '{}'",
+                crate::tokens::PRE_AUTHORIZED_CODE_JWT_TYP
+            ));
+        }
         if signing.access_token_ttl_seconds == 0 || signing.access_token_ttl_seconds > 600 {
             return invalid_access_token_signing(
                 "access_token_ttl_seconds must be between 1 and 600",
@@ -1245,10 +1254,6 @@ pub struct Oid4vciPreAuthorizedCodeConfig {
     /// Pre-authorized-code lifetime in seconds.
     #[serde(default = "default_pre_authorized_code_ttl_seconds")]
     pub pre_authorized_code_ttl_seconds: u64,
-    /// Access-token lifetime in seconds for tokens minted at the token
-    /// endpoint.
-    #[serde(default = "default_access_token_ttl_seconds")]
-    pub access_token_ttl_seconds: u64,
 }
 
 impl Default for Oid4vciPreAuthorizedCodeConfig {
@@ -1258,7 +1263,6 @@ impl Default for Oid4vciPreAuthorizedCodeConfig {
             tx_code: Oid4vciTxCodeConfig::default(),
             esignet: Oid4vciEsignetRpConfig::default(),
             pre_authorized_code_ttl_seconds: default_pre_authorized_code_ttl_seconds(),
-            access_token_ttl_seconds: default_access_token_ttl_seconds(),
         }
     }
 }
@@ -1273,11 +1277,6 @@ impl Oid4vciPreAuthorizedCodeConfig {
         if self.pre_authorized_code_ttl_seconds == 0 || self.pre_authorized_code_ttl_seconds > 600 {
             return invalid_oid4vci(
                 "pre_authorized_code.pre_authorized_code_ttl_seconds must be between 1 and 600",
-            );
-        }
-        if self.access_token_ttl_seconds == 0 || self.access_token_ttl_seconds > 600 {
-            return invalid_oid4vci(
-                "pre_authorized_code.access_token_ttl_seconds must be between 1 and 600",
             );
         }
         Ok(())
@@ -6907,7 +6906,6 @@ esignet:
   scopes:
     - openid
 pre_authorized_code_ttl_seconds: 300
-access_token_ttl_seconds: 300
 "#,
         )
         .expect("pre-auth config is valid YAML");

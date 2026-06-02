@@ -149,7 +149,7 @@ pub async fn mint_pre_authorized_code(
     payload.insert("iat".to_string(), Value::from(claims.iat));
     payload.insert("nbf".to_string(), Value::from(claims.iat));
     payload.insert("exp".to_string(), Value::from(claims.exp));
-    insert_subject_claims(&mut payload, &claims.subject);
+    insert_subject_claims(&mut payload, &claims.subject)?;
     let compact = sign_compact_jwt(signer, typ, Value::Object(payload)).await?;
     Ok(SignedNotaryToken {
         typ: typ.to_string(),
@@ -182,7 +182,7 @@ pub async fn mint_access_token(
     payload.insert("iat".to_string(), Value::from(claims.iat));
     payload.insert("nbf".to_string(), Value::from(claims.iat));
     payload.insert("exp".to_string(), Value::from(claims.exp));
-    insert_subject_claims(&mut payload, &claims.subject);
+    insert_subject_claims(&mut payload, &claims.subject)?;
     let compact = sign_compact_jwt(signer, typ, Value::Object(payload)).await?;
     Ok(SignedNotaryToken {
         typ: typ.to_string(),
@@ -210,11 +210,18 @@ impl VerifiedNotaryToken {
         self.payload.get(name).and_then(Value::as_i64)
     }
 
-    /// Space-separated `scope` claim split into individual scopes.
+    /// Space-separated `scope` claim split into individual scopes. Empty
+    /// segments (from leading, trailing, or repeated spaces) are dropped.
     #[must_use]
     pub fn scopes(&self) -> Vec<String> {
         self.claim_str("scope")
-            .map(|scope| scope.split(' ').map(ToString::to_string).collect())
+            .map(|scope| {
+                scope
+                    .split(' ')
+                    .filter(|segment| !segment.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -236,6 +243,16 @@ pub fn verify_notary_token(
     now: i64,
 ) -> Result<VerifiedNotaryToken, EvidenceError> {
     let (header_b64, payload_b64, signature_b64) = split_compact(compact)?;
+    // Verify the signature over the raw segments BEFORE decoding any JSON, so a
+    // malformed or hostile header/payload never reaches the JSON parser on an
+    // unauthenticated token. The expected key is supplied by the caller, so the
+    // header is not needed to locate it; the key fixes the algorithm.
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|_| EvidenceError::MissingCredential)?;
+    verify_signature(signing_input.as_bytes(), &signature, public_jwk)
+        .map_err(|_| EvidenceError::MissingCredential)?;
     let header = decode_segment_json(header_b64)?;
     if header.get("alg").and_then(Value::as_str) != Some(NOTARY_TOKEN_SIGNING_ALG) {
         return Err(EvidenceError::MissingCredential);
@@ -243,12 +260,6 @@ pub fn verify_notary_token(
     if header.get("typ").and_then(Value::as_str) != Some(expected_typ) {
         return Err(EvidenceError::MissingCredential);
     }
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let signature = URL_SAFE_NO_PAD
-        .decode(signature_b64)
-        .map_err(|_| EvidenceError::MissingCredential)?;
-    verify_signature(signing_input.as_bytes(), &signature, public_jwk)
-        .map_err(|_| EvidenceError::MissingCredential)?;
     let payload = decode_segment_json(payload_b64)?;
     if payload.get("iss").and_then(Value::as_str) != Some(expected_issuer) {
         return Err(EvidenceError::MissingCredential);
@@ -271,7 +282,35 @@ pub fn verify_notary_token(
     Ok(VerifiedNotaryToken { header, payload })
 }
 
-fn insert_subject_claims(payload: &mut Map<String, Value>, subject: &BoundSubject) {
+/// Claim names the Notary tokens already populate. A configured
+/// `subject_binding_claim` must not collide with any of these, or inserting it
+/// would overwrite a standard or required claim (`iss`/`aud`/`exp`/...).
+const RESERVED_TOKEN_CLAIMS: &[&str] = &[
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "nbf",
+    "iat",
+    "jti",
+    "scope",
+    "client_id",
+    "token_type",
+    "credential_configuration_id",
+    "acr",
+    "auth_time",
+];
+
+fn insert_subject_claims(
+    payload: &mut Map<String, Value>,
+    subject: &BoundSubject,
+) -> Result<(), EvidenceError> {
+    // A subject-binding claim configured to a reserved/emitted claim name would
+    // overwrite it (e.g. clobbering `aud` with the civil ID). Refuse to mint
+    // rather than emit a malformed token.
+    if RESERVED_TOKEN_CLAIMS.contains(&subject.subject_binding_claim.as_str()) {
+        return Err(EvidenceError::CredentialIssuanceFailed);
+    }
     payload.insert("sub".to_string(), Value::String(subject.subject.clone()));
     payload.insert(
         "client_id".to_string(),
@@ -290,6 +329,7 @@ fn insert_subject_claims(payload: &mut Map<String, Value>, subject: &BoundSubjec
     if let Some(auth_time) = subject.auth_time {
         payload.insert("auth_time".to_string(), Value::from(auth_time));
     }
+    Ok(())
 }
 
 fn audience_value(audiences: &[String]) -> Value {
@@ -704,5 +744,26 @@ mod tests {
         // The derived Debug recurses into BoundSubject's redacting Debug.
         assert!(!debug.contains("citizen-subject-1"));
         assert!(!debug.contains(CIVIL_ID));
+    }
+
+    #[test]
+    fn mint_rejects_subject_binding_claim_colliding_with_a_reserved_claim() {
+        // A subject_binding_claim configured to a reserved/emitted claim name
+        // would overwrite that claim; minting must fail loudly instead.
+        for reserved in ["iss", "aud", "sub", "exp", "scope", "client_id"] {
+            let mut subject = bound_subject();
+            subject.subject_binding_claim = reserved.to_string();
+            let claims = AccessTokenClaims {
+                subject,
+                ..access_token_claims()
+            };
+            let error = block_on(mint_access_token(
+                &access_token_signer(),
+                NOTARY_ACCESS_TOKEN_JWT_TYP,
+                &claims,
+            ))
+            .expect_err("a reserved subject-binding claim must be rejected");
+            assert!(matches!(error, EvidenceError::CredentialIssuanceFailed));
+        }
     }
 }
