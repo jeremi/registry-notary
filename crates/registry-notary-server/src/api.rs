@@ -1667,13 +1667,18 @@ fn offer_request_uri(offer: &CredentialOffer) -> Result<String, ()> {
 
 /// Percent-encode a value for a query string (RFC 3986 unreserved set kept).
 fn url_percent_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len() * 3);
     for byte in value.as_bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*byte as char);
             }
-            other => out.push_str(&format!("%{other:02X}")),
+            other => {
+                out.push('%');
+                out.push(HEX[(other >> 4) as usize] as char);
+                out.push(HEX[(other & 0x0F) as usize] as char);
+            }
         }
     }
     out
@@ -1697,12 +1702,18 @@ fn offer_page_html(offer_uri: &str, pin: &str) -> String {
 }
 
 fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Reconstruct the `BoundSubject` carried inside a verified pre-authorized code.
