@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "service": "registry-notary",
+  "policies": [
+    {
+      "tool": "zizmor",
+      "minimum_severity": "high",
+      "action": "block_unreviewed"
+    },
+    {
+      "tool": "grype",
+      "minimum_severity": "critical",
+      "action": "block_unreviewed"
+    }
+  ],
+  "reviewed_findings": []
+}
