@@ -210,6 +210,74 @@
     {
       "service": "registry-notary",
       "listener": "public",
+      "method": "GET",
+      "path": "/oid4vci/offer/start",
+      "feature": null,
+      "audience": "external",
+      "auth": "none",
+      "scopes": [],
+      "rate_limit": null,
+      "audit": "not_applicable",
+      "openapi": true,
+      "stability": "beta",
+      "data_classification": "credential",
+      "notes": "Intentionally unauthenticated public OID4VCI pre-authorized-code browser start route. The route reserves bounded login state and redirects to the configured IdP without minting a credential offer.",
+      "source": "manual",
+      "enforcement_tests": [
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_offer_start_redirects_to_esignet_and_mints_nothing",
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_disabled_returns_404_and_offer_is_authorization_code"
+      ],
+      "waiver": null
+    },
+    {
+      "service": "registry-notary",
+      "listener": "public",
+      "method": "GET",
+      "path": "/oid4vci/offer/callback",
+      "feature": null,
+      "audience": "external",
+      "auth": "none",
+      "scopes": [],
+      "rate_limit": null,
+      "audit": "required",
+      "openapi": true,
+      "stability": "beta",
+      "data_classification": "secret-adjacent",
+      "notes": "Intentionally unauthenticated public OID4VCI pre-authorized-code callback route. Route-local state, nonce, IdP token exchange, subject binding, and hashed-only audit controls apply.",
+      "source": "manual",
+      "enforcement_tests": [
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_callback_mints_pre_authorized_offer_with_tx_code",
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_callback_and_token_audit_events_carry_only_hashes"
+      ],
+      "waiver": null
+    },
+    {
+      "service": "registry-notary",
+      "listener": "public",
+      "method": "POST",
+      "path": "/oid4vci/token",
+      "feature": null,
+      "audience": "external",
+      "auth": "none",
+      "scopes": [],
+      "rate_limit": "preauth_token",
+      "audit": "required",
+      "openapi": true,
+      "stability": "beta",
+      "data_classification": "secret-adjacent",
+      "notes": "Intentionally unauthenticated public OID4VCI pre-authorized-code token route. Route-local code, PIN, replay, flood-throttle, and hashed-only audit controls apply before access-token issuance.",
+      "source": "manual",
+      "enforcement_tests": [
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_token_endpoint_issues_access_token_and_c_nonce",
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_token_rejects_wrong_and_missing_tx_code",
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_random_code_flood_is_throttled_per_client_address",
+        "crates/registry-notary-server/tests/standalone_http.rs::preauth_callback_and_token_audit_events_carry_only_hashes"
+      ],
+      "waiver": null
+    },
+    {
+      "service": "registry-notary",
+      "listener": "public",
       "method": "POST",
       "path": "/oid4vci/nonce",
       "feature": null,
@@ -574,6 +642,30 @@
       "enforcement_tests": [
         "crates/registry-notary-openfn-sidecar/tests/rda_contract.rs::health_ready_and_metrics_are_available_without_secret_disclosure",
         "crates/registry-notary-openfn-sidecar/tests/rda_contract.rs::missing_purpose_is_rejected_before_worker_dispatch"
+      ],
+      "waiver": null
+    },
+    {
+      "service": "registry-notary",
+      "listener": "sidecar",
+      "method": "POST",
+      "path": "/v1/datasets/{dataset}/entities/{entity}/records:batchMatch",
+      "feature": null,
+      "audience": "internal",
+      "auth": "bearer",
+      "scopes": [
+        "sidecar:read"
+      ],
+      "rate_limit": null,
+      "audit": "not_applicable",
+      "openapi": false,
+      "stability": "beta",
+      "data_classification": "personal",
+      "notes": "OpenFn sidecar batch-match route. Bearer auth, data-purpose validation, request minimization, and worker-dispatch guards are enforced before source access.",
+      "source": "manual",
+      "enforcement_tests": [
+        "crates/registry-notary-openfn-sidecar/tests/rda_contract.rs::batch_match_returns_per_item_projected_rda_data_and_sends_minimized_worker_request",
+        "crates/registry-notary-openfn-sidecar/tests/rda_contract.rs::batch_match_requires_auth_and_purpose_before_worker_dispatch"
       ],
       "waiver": null
     }

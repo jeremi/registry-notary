@@ -84,6 +84,30 @@
     },
     {
       "listener": "public",
+      "path": "/oid4vci/offer/start",
+      "methods": [
+        "GET"
+      ],
+      "source": "crates/registry-notary-server/src/api.rs"
+    },
+    {
+      "listener": "public",
+      "path": "/oid4vci/offer/callback",
+      "methods": [
+        "GET"
+      ],
+      "source": "crates/registry-notary-server/src/api.rs"
+    },
+    {
+      "listener": "public",
+      "path": "/oid4vci/token",
+      "methods": [
+        "POST"
+      ],
+      "source": "crates/registry-notary-server/src/api.rs"
+    },
+    {
+      "listener": "public",
       "path": "/oid4vci/nonce",
       "methods": [
         "POST"
@@ -216,6 +240,14 @@
       "path": "/v1/datasets/{dataset}/entities/{entity}/records",
       "methods": [
         "GET"
+      ],
+      "source": "crates/registry-notary-openfn-sidecar/src/sidecar.rs"
+    },
+    {
+      "listener": "sidecar",
+      "path": "/v1/datasets/{dataset}/entities/{entity}/records:batchMatch",
+      "methods": [
+        "POST"
       ],
       "source": "crates/registry-notary-openfn-sidecar/src/sidecar.rs"
     }

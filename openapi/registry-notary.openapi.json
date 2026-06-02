@@ -923,6 +923,200 @@
         "security": []
       }
     },
+    "/oid4vci/offer/callback": {
+      "get": {
+        "summary": "Complete eSignet login and render a pre-authorized-code offer",
+        "description": "Public and unauthenticated. Consumes the login state, exchanges the eSignet code with private_key_jwt, validates the id_token, and mints one single-use pre-authorized_code plus one numeric tx_code (PIN). Renders an HTML offer page carrying the credential offer URI and the PIN out-of-band from the QR. Returns 404 when the pre-authorized-code flow is disabled.",
+        "operationId": "completeOid4vciOffer",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Offer page with the credential offer URI and tx_code PIN",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Login state, eSignet code, or id_token is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pre-authorized-code flow is disabled"
+          },
+          "500": {
+            "description": "OpenID4VCI issuer failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/oid4vci/offer/start": {
+      "get": {
+        "summary": "Begin an authenticated pre-authorized-code offer",
+        "description": "Public and unauthenticated. Begins the eSignet authorization-code login as the confidential RP and 302-redirects the browser to eSignet. Mints no pre-authorized_code or credential material. Returns 404 when the pre-authorized-code flow is disabled. Error responses use the OpenID4VCI error envelope, not RFC 9457 Problem Details.",
+        "operationId": "startOid4vciOffer",
+        "parameters": [
+          {
+            "name": "credential_configuration_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Redirect to the eSignet authorization endpoint"
+          },
+          "400": {
+            "description": "Invalid or unknown credential configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pre-authorized-code flow is disabled"
+          },
+          "500": {
+            "description": "OpenID4VCI issuer failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/oid4vci/token": {
+      "post": {
+        "summary": "Redeem a pre-authorized-code for an access token",
+        "description": "Public and unauthenticated OID4VCI token endpoint for the pre-authorized-code grant. Accepts only grant_type=urn:ietf:params:oauth:grant-type:pre-authorized_code with a valid, unexpired, single-use pre-authorized_code and a matching tx_code (the PIN is mandatory). Mints a short-TTL Notary-signed access token plus a c_nonce. Returns 404 when the pre-authorized-code flow is disabled. Error responses use the OpenID4VCI error envelope, not RFC 9457 Problem Details.",
+        "operationId": "redeemOid4vciToken",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Token response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                },
+                "example": {
+                  "access_token": "eyJhbGciOiJFZERTQSIsInR5cCI6InJlZ2lzdHJ5LW5vdGFyeS1hY2Nlc3MrancifQ.payload.signature",
+                  "c_nonce": "b64url-nonce",
+                  "c_nonce_expires_in": 300,
+                  "expires_in": 300,
+                  "token_type": "Bearer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, grant, or tx_code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                },
+                "example": {
+                  "error": "invalid_grant",
+                  "error_description": "pre-authorized code or tx_code is invalid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pre-authorized-code flow is disabled"
+          },
+          "429": {
+            "description": "Too many token attempts (wrong-PIN lockout or random-code flood)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                },
+                "example": {
+                  "error": "slow_down",
+                  "error_description": "too many token requests"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Token issuance failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Oid4vciError"
+                },
+                "example": {
+                  "error": "server_error",
+                  "error_description": "token issuance failed"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/openapi.json": {
       "get": {
         "summary": "Fetch this OpenAPI document",
@@ -3155,6 +3349,54 @@
           }
         },
         "additionalProperties": false
+      },
+      "TokenRequest": {
+        "type": "object",
+        "required": [
+          "grant_type",
+          "pre-authorized_code",
+          "tx_code"
+        ],
+        "properties": {
+          "grant_type": {
+            "type": "string",
+            "example": "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+          },
+          "pre-authorized_code": {
+            "type": "string"
+          },
+          "tx_code": {
+            "type": "string",
+            "description": "The numeric PIN shown on the offer page; mandatory for this grant."
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "required": [
+          "access_token",
+          "token_type"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string"
+          },
+          "c_nonce": {
+            "type": "string"
+          },
+          "c_nonce_expires_in": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "token_type": {
+            "type": "string",
+            "example": "Bearer"
+          }
+        }
       }
     },
     "securitySchemes": {
