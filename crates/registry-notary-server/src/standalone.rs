@@ -1333,20 +1333,16 @@ struct EsignetTokenResponse {
     access_token: Option<String>,
 }
 
-/// Read the subject-binding claim from a verified `id_token`.
-fn subject_binding_value_from_id_token(
-    verified: &VerifiedToken,
+/// Read the subject-binding claim value from verified OIDC claims (the
+/// `id_token` or the userinfo JWS).
+fn subject_binding_value_from_claims(
+    claims: &registry_platform_oidc::Claims,
     subject_binding_claim: &str,
 ) -> Result<String, EvidenceError> {
     let value = if subject_binding_claim == "sub" {
-        verified
-            .claims
-            .sub
-            .clone()
-            .ok_or(EvidenceError::MissingCredential)?
+        claims.sub.clone().ok_or(EvidenceError::MissingCredential)?
     } else {
-        verified
-            .claims
+        claims
             .extra
             .get(subject_binding_claim)
             .and_then(Value::as_str)
@@ -1357,6 +1353,14 @@ fn subject_binding_value_from_id_token(
         return Err(EvidenceError::MissingCredential);
     }
     Ok(value)
+}
+
+/// Read the subject-binding claim from a verified `id_token`.
+fn subject_binding_value_from_id_token(
+    verified: &VerifiedToken,
+    subject_binding_claim: &str,
+) -> Result<String, EvidenceError> {
+    subject_binding_value_from_claims(&verified.claims, subject_binding_claim)
 }
 
 impl PreAuthRuntime {
@@ -1619,23 +1623,7 @@ impl PreAuthRuntime {
             )
             .await
             .map_err(|_| EvidenceError::MissingCredential)?;
-        let subject_binding_value = if subject_binding_claim == "sub" {
-            userinfo
-                .sub
-                .clone()
-                .ok_or(EvidenceError::MissingCredential)?
-        } else {
-            userinfo
-                .extra
-                .get(subject_binding_claim)
-                .and_then(Value::as_str)
-                .ok_or(EvidenceError::MissingCredential)?
-                .to_string()
-        };
-        if subject_binding_value.trim().is_empty() {
-            return Err(EvidenceError::MissingCredential);
-        }
-        Ok(subject_binding_value)
+        subject_binding_value_from_claims(&userinfo, subject_binding_claim)
     }
 
     /// Build the `EsignetSubject` from the verified `id_token`, carrying the
