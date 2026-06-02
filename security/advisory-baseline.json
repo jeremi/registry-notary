@@ -13,5 +13,17 @@
       "action": "block_unreviewed"
     }
   ],
-  "reviewed_findings": []
+  "reviewed_findings": [
+    {
+      "tool": "grype",
+      "fingerprint": "grype|registry-notary-openfn-sidecar-image|CVE-2023-45853|zlib1g|1:1.2.13.dfsg-1|deb",
+      "rule_id": "CVE-2023-45853",
+      "severity": "critical",
+      "status": "accepted_risk",
+      "owner": "@PublicSchema/maintainers",
+      "reason": "Existing zlib1g finding in the OpenFN sidecar image. Keep as a reviewed ratchet entry until the sidecar base image can move to a fixed distro package.",
+      "reviewed_at": "2026-06-02",
+      "expires_at": "2026-09-01"
+    }
+  ]
 }
