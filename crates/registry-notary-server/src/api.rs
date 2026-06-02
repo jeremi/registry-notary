@@ -3034,15 +3034,14 @@ fn oid4vci_metadata(config: &Oid4vciConfig) -> CredentialIssuerMetadata {
     }
 }
 
-/// The Notary's own OID4VCI token endpoint URL, derived from the credential
-/// issuer base the same way the credential endpoint is. Returns `None` when the
-/// configured `credential_issuer` is not a usable absolute URL.
+/// The Notary's own OID4VCI token endpoint URL: the credential-issuer base with
+/// `oid4vci/token` appended (preserving any configured base subpath). Returns
+/// `None` when the configured `credential_issuer` is not a usable absolute URL.
 fn oid4vci_token_endpoint_url(config: &Oid4vciConfig) -> Option<String> {
-    let issuer = config.credential_issuer.trim().trim_end_matches('/');
-    if issuer.is_empty() {
-        return None;
-    }
-    Some(format!("{issuer}/oid4vci/token"))
+    let base = reqwest::Url::parse(config.credential_issuer.trim()).ok()?;
+    registry_platform_httputil::url::append_path_segments(&base, &["oid4vci", "token"])
+        .ok()
+        .map(|url| url.to_string())
 }
 
 fn oid4vci_configuration_metadata(

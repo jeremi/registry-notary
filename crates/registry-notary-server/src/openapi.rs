@@ -2260,7 +2260,7 @@ fn credential_response_schema() -> Value {
 fn token_request_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["grant_type"],
+        "required": ["grant_type", "pre-authorized_code", "tx_code"],
         "properties": {
             "grant_type": {
                 "type": "string",
