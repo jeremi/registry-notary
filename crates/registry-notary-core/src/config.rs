@@ -1132,6 +1132,28 @@ impl Oid4vciConfig {
             );
         }
         self.pre_authorized_code.validate()?;
+        // The eSignet RP client assertion is signed with this key, so it must
+        // resolve to an active signing key. Surface that at config time rather
+        // than as a startup failure when the pre-auth flow is first built.
+        if self.pre_authorized_code.enabled {
+            let key_id = self
+                .pre_authorized_code
+                .esignet
+                .client_signing_key_id
+                .as_str();
+            let key = evidence.signing_keys.get(key_id).ok_or_else(|| {
+                EvidenceConfigError::InvalidOid4vciConfig {
+                    reason: format!(
+                        "pre_authorized_code.esignet.client_signing_key_id '{key_id}' must reference an evidence.signing_keys entry"
+                    ),
+                }
+            })?;
+            if !key.status.may_sign() {
+                return invalid_oid4vci(format!(
+                    "pre_authorized_code.esignet.client_signing_key_id '{key_id}' must reference an active signing key"
+                ));
+            }
+        }
         // The pre-auth callback resolves the subject-binding claim from the
         // eSignet userinfo endpoint when the claim is userinfo-sourced, so the
         // endpoint must be configured for that path to work.
@@ -7189,6 +7211,56 @@ access_token_ttl_seconds: 300
         config
             .validate()
             .expect("an RS256 eSignet RP client-assertion key validates");
+    }
+
+    #[test]
+    fn pre_auth_client_signing_key_must_exist() {
+        let mut config = valid_pre_auth_config();
+        config
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id = "missing-rp-key".to_string();
+        let reason = match config
+            .validate()
+            .expect_err("a missing RP client-assertion key must fail validation")
+        {
+            EvidenceConfigError::InvalidOid4vciConfig { reason } => reason,
+            other => panic!("unexpected error variant: {other}"),
+        };
+        assert!(reason.contains("client_signing_key_id"));
+        assert!(reason.contains("evidence.signing_keys"));
+    }
+
+    #[test]
+    fn pre_auth_client_signing_key_must_be_active() {
+        let mut config = valid_pre_auth_config();
+        config.evidence.signing_keys.insert(
+            "esignet-rp-key".to_string(),
+            rs256_signing_key("ESIGNET_RP_KEY", "did:web:rp.example#esignet-rp-key"),
+        );
+        config
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id = "esignet-rp-key".to_string();
+        // PublishOnly cannot sign; it requires public_jwk_env and no private_jwk_env.
+        let key = config
+            .evidence
+            .signing_keys
+            .get_mut("esignet-rp-key")
+            .expect("esignet rp key exists");
+        key.status = SigningKeyStatus::PublishOnly;
+        key.public_jwk_env = "ESIGNET_RP_PUBLIC_KEY".to_string();
+        key.private_jwk_env = String::new();
+        let reason = match config
+            .validate()
+            .expect_err("an inactive RP client-assertion key must fail validation")
+        {
+            EvidenceConfigError::InvalidOid4vciConfig { reason } => reason,
+            other => panic!("unexpected error variant: {other}"),
+        };
+        assert!(reason.contains("active signing key"));
     }
 
     #[test]
