@@ -2958,9 +2958,8 @@ fn is_public_probe_path(path: &str) -> bool {
             | "/oid4vci/nonce"
             | "/federation/v1/evaluations"
             | "/credentials/{*vct_path}"
-    ) || path.starts_with("/credentials/")
-        || path.starts_with("/.well-known/vct/")
-        || path.starts_with("/v1/credentials/")
+            | "/v1/credentials/{credential_id}/status"
+    ) || path.starts_with("/.well-known/vct/")
 }
 
 async fn admin_metrics_handler(
