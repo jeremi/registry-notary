@@ -1169,6 +1169,7 @@ impl SigningKeyRegistry {
         let mut issuers = BTreeMap::new();
         let mut providers = BTreeMap::new();
         let mut public_jwks_by_kid = BTreeMap::new();
+        #[cfg_attr(not(feature = "pkcs11"), allow(unused_mut))]
         let mut readiness_flags = Vec::new();
         for (key_id, key) in &config.signing_keys {
             if !key.status.may_publish() {
@@ -2282,14 +2283,15 @@ mod pkcs11 {
             if remaining.is_zero() {
                 return Err(SigningError::external("PKCS#11 sign timed out"));
             }
-            let mut permit = Some(permit);
             let provider = self.clone();
             let payload = payload.to_vec();
-            let task = tokio::task::spawn_blocking(move || provider.sign_sync(&payload));
+            let task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                provider.sign_sync(&payload)
+            });
             let result = tokio::time::timeout(remaining, task)
                 .await
                 .map_err(|_| {
-                    drop(permit.take());
                     self.mark_unhealthy();
                     tracing::error!(
                         provider = "pkcs11",
@@ -2299,7 +2301,6 @@ mod pkcs11 {
                     SigningError::external("PKCS#11 sign timed out")
                 })?
                 .map_err(|_| SigningError::external("PKCS#11 sign task failed"))?;
-            drop(permit.take());
             match &result {
                 Ok(_) => tracing::debug!(
                     provider = "pkcs11",
@@ -5299,10 +5300,12 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     #[cfg(feature = "pkcs11")]
     use base64::Engine;
+    #[cfg(feature = "pkcs11")]
+    use registry_notary_core::{ClaimProvenance, ClaimResultView, TargetRefView};
     use registry_notary_core::{
-        ClaimProvenance, ClaimResultView, EvaluateRequest, SelfAttestationDenialCode,
-        SelfAttestationRateLimitsConfig, SourceConnectionConfig, SourceLookupConfig,
-        SourceQueryFieldConfig, TargetRefView, FORMAT_CLAIM_RESULT_JSON,
+        EvaluateRequest, SelfAttestationDenialCode, SelfAttestationRateLimitsConfig,
+        SourceConnectionConfig, SourceLookupConfig, SourceQueryFieldConfig,
+        FORMAT_CLAIM_RESULT_JSON,
     };
     use registry_notary_openfn_sidecar::{sidecar_router, SidecarConfig};
 

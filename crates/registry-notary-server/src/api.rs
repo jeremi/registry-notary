@@ -943,10 +943,10 @@ async fn oid4vci_credential(
             Err(error) => return oid4vci_error_response(error),
         };
     let expected_nonce = if state.oid4vci.nonce.enabled {
-        match oid4vci_proof_nonce(&request.proof.jwt) {
-            Ok(nonce) => Some(nonce),
-            Err(error) => return oid4vci_error_response(error),
-        }
+        let Some(nonce) = validated_proof.nonce.as_deref() else {
+            return oid4vci_error_response(Oid4vciWireError::InvalidProof);
+        };
+        Some(nonce)
     } else {
         None
     };
@@ -964,7 +964,7 @@ async fn oid4vci_credential(
     if holder_key_matches_issuer_key(&validated_proof.holder_jwk, &issuer.public_jwk()) {
         return oid4vci_error_response(Oid4vciWireError::InvalidProof);
     }
-    if let Some(nonce) = expected_nonce.as_deref() {
+    if let Some(nonce) = expected_nonce {
         let key = match state.self_attestation_rate_keys.oid4vci_nonce(
             &state.oid4vci.credential_issuer,
             configuration_id,
@@ -5605,6 +5605,41 @@ mod tests {
         let missing_nonce_body: Value =
             serde_json::from_slice(&missing_nonce_body).expect("error body parses");
         assert_eq!(missing_nonce_body["error"], "invalid_proof");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        let proof_without_nonce =
+            sign_oid4vci_proof_without_nonce(&state.oid4vci.credential_issuer);
+        let missing_validated_nonce = oid4vci_credential(
+            Some(Extension(Arc::clone(&state))),
+            Some(Extension(fresh_oidc_principal(
+                Some("client_id:citizen-portal"),
+                &["self_attestation"],
+            ))),
+            Some(Extension(validated_oid4vci_proof(
+                &state,
+                &proof_without_nonce,
+                None,
+            ))),
+            Json(Oid4vciCredentialRequest {
+                format: SD_JWT_VC_FORMAT.to_string(),
+                credential_identifier: Some("person_is_alive_sd_jwt".to_string()),
+                credential_configuration_id: None,
+                vct: None,
+                proof: registry_platform_oid4vci::CredentialRequestProof {
+                    proof_type: PROOF_TYPE_JWT.to_string(),
+                    jwt: proof_without_nonce,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(missing_validated_nonce.status(), StatusCode::BAD_REQUEST);
+        let missing_validated_nonce_body =
+            axum::body::to_bytes(missing_validated_nonce.into_body(), usize::MAX)
+                .await
+                .expect("body reads");
+        let missing_validated_nonce_body: Value =
+            serde_json::from_slice(&missing_validated_nonce_body).expect("error body parses");
+        assert_eq!(missing_validated_nonce_body["error"], "invalid_proof");
         assert_eq!(reads.load(Ordering::SeqCst), 0);
 
         let nonce = "nonce-1";
