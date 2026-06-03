@@ -3150,7 +3150,11 @@ fn oid4vci_credential_type_display_metadata(
 ) -> Value {
     let display = oid4vci_credential_display_metadata(configuration);
     let mut value = serde_json::to_value(display).expect("display metadata serializes");
-    if value.get("locale").is_none() {
+    if value
+        .get("locale")
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
         value["locale"] = json!("en-US");
     }
     value
@@ -5357,6 +5361,21 @@ mod tests {
         assert!(!text.contains("token_env"));
         assert!(!text.contains("source_connections"));
         assert!(!text.contains("NAT-123"));
+    }
+
+    #[test]
+    fn oid4vci_type_metadata_defaults_display_locale_when_unconfigured() {
+        let mut oid4vci = oid4vci_config();
+        let configuration = oid4vci
+            .credential_configurations
+            .get_mut("person_is_alive_sd_jwt")
+            .expect("configuration exists");
+        configuration.display.locale = None;
+
+        let metadata = oid4vci_type_metadata_document(configuration);
+
+        assert_eq!(metadata["display"][0]["locale"], "en-US");
+        assert_eq!(metadata["claims"][0]["display"][0]["locale"], "en-US");
     }
 
     #[test]
