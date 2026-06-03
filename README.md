@@ -313,9 +313,9 @@ docker build \
   -t registry-notary:cel .
 ```
 
-The product container workflow publishes CI images as `main` / `sha-<commit>`
-with PKCS#11 compiled in, and the CEL-enabled lab image as `main-cel` /
-`sha-<commit>-cel` with both CEL and PKCS#11 enabled under
+The product container workflow publishes the default image as `main` /
+`sha-<commit>` with PKCS#11 compiled in, and the CEL-enabled lab image as
+`main-cel` / `sha-<commit>-cel` with both CEL and PKCS#11 enabled under
 `ghcr.io/jeremi/registry-notary`. First serious release readiness is checked
 through the coordinated pre-tag release plan. Lab deployments should consume the
 selected CEL-enabled image by immutable digest for rollback.
