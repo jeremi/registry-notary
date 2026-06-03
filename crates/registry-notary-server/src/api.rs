@@ -38,8 +38,8 @@ use registry_platform_oid4vci::{
     CredentialIssuerMetadata, CredentialOffer, CredentialRequest as Oid4vciCredentialRequest,
     CredentialResponse as Oid4vciCredentialResponse, DisplayImageMetadata, DisplayMetadata,
     NonceRequest as Oid4vciNonceRequest, NonceResponse, ProofValidationPolicy,
-    TokenRequest as Oid4vciTokenRequest, TokenResponse as Oid4vciTokenResponse, TxCode, WireError,
-    PRE_AUTHORIZED_CODE_GRANT_TYPE, PROOF_TYPE_JWT, SD_JWT_VC_FORMAT,
+    TokenRequest as Oid4vciTokenRequest, TokenResponse as Oid4vciTokenResponse, TxCode,
+    ValidatedProof, WireError, PRE_AUTHORIZED_CODE_GRANT_TYPE, PROOF_TYPE_JWT, SD_JWT_VC_FORMAT,
 };
 use registry_platform_replay::{ReplayKey, ReplayScope, RequiredReplayError};
 use registry_platform_sdjwt::{validate_holder_proof, HolderProofBindings, HolderProofPolicy};
@@ -150,7 +150,7 @@ pub async fn oid4vci_proof_precheck_middleware(
     } else {
         None
     };
-    if validate_proof_jwt(
+    let validated_proof = match validate_proof_jwt(
         &request.proof.jwt,
         &ProofValidationPolicy::credential_endpoint(
             &state.oid4vci.credential_issuer,
@@ -159,13 +159,13 @@ pub async fn oid4vci_proof_precheck_middleware(
             Duration::from_secs(state.oid4vci.proof.max_clock_skew_seconds),
         ),
         OffsetDateTime::now_utc().unix_timestamp(),
-    )
-    .is_err()
-    {
-        return oid4vci_error_response(Oid4vciWireError::InvalidProof);
-    }
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    ) {
+        Ok(proof) => proof,
+        Err(_) => return oid4vci_error_response(Oid4vciWireError::InvalidProof),
+    };
+    let mut request = Request::from_parts(parts, Body::from(bytes));
+    request.extensions_mut().insert(validated_proof);
+    next.run(request).await
 }
 
 async fn healthz() -> Response {
@@ -856,6 +856,11 @@ async fn oid4vci_nonce(
 }
 
 fn oid4vci_proof_nonce(proof_jwt: &str) -> Result<String, Oid4vciWireError> {
+    #[derive(Deserialize)]
+    struct NonceClaims {
+        nonce: Option<String>,
+    }
+
     let mut parts = proof_jwt.split('.');
     let Some(_) = parts.next() else {
         return Err(Oid4vciWireError::InvalidProof);
@@ -872,19 +877,18 @@ fn oid4vci_proof_nonce(proof_jwt: &str) -> Result<String, Oid4vciWireError> {
     let payload = URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|_| Oid4vciWireError::InvalidProof)?;
-    let claims: Value =
+    let claims: NonceClaims =
         serde_json::from_slice(&payload).map_err(|_| Oid4vciWireError::InvalidProof)?;
     claims
-        .get("nonce")
-        .and_then(Value::as_str)
+        .nonce
         .filter(|nonce| !nonce.is_empty())
-        .map(str::to_string)
         .ok_or(Oid4vciWireError::InvalidProof)
 }
 
 async fn oid4vci_credential(
     state: Option<Extension<Arc<RegistryNotaryApiState>>>,
     principal: Option<Extension<EvidencePrincipal>>,
+    validated_proof: Option<Extension<ValidatedProof>>,
     Json(request): Json<Oid4vciCredentialRequest>,
 ) -> Response {
     let Some(Extension(state)) = state else {
@@ -910,6 +914,9 @@ async fn oid4vci_credential(
     if request.format != SD_JWT_VC_FORMAT || request.proof.proof_type != PROOF_TYPE_JWT {
         return oid4vci_error_response(Oid4vciWireError::UnsupportedCredentialType);
     }
+    let Some(Extension(validated_proof)) = validated_proof else {
+        return oid4vci_error_response(Oid4vciWireError::InvalidProof);
+    };
     let (configuration_id, configuration) =
         match oid4vci_configuration_for_request(&state.oid4vci, &request) {
             Ok(configuration) => configuration,
@@ -922,19 +929,6 @@ async fn oid4vci_credential(
         }
     } else {
         None
-    };
-    let validated_proof = match validate_proof_jwt(
-        &request.proof.jwt,
-        &ProofValidationPolicy::credential_endpoint(
-            &state.oid4vci.credential_issuer,
-            expected_nonce.as_deref(),
-            Duration::from_secs(state.oid4vci.proof.max_age_seconds),
-            Duration::from_secs(state.oid4vci.proof.max_clock_skew_seconds),
-        ),
-        OffsetDateTime::now_utc().unix_timestamp(),
-    ) {
-        Ok(proof) => proof,
-        Err(_) => return oid4vci_error_response(Oid4vciWireError::InvalidProof),
     };
     let profile = match evidence
         .credential_profiles
@@ -950,10 +944,7 @@ async fn oid4vci_credential(
     if holder_key_matches_issuer_key(&validated_proof.holder_jwk, &issuer.public_jwk()) {
         return oid4vci_error_response(Oid4vciWireError::InvalidProof);
     }
-    if state.oid4vci.nonce.enabled {
-        let nonce = expected_nonce
-            .as_deref()
-            .expect("enabled nonce enforcement extracted a proof nonce");
+    if let Some(nonce) = expected_nonce.as_deref() {
         let key = match state.self_attestation_rate_keys.oid4vci_nonce(
             &state.oid4vci.credential_issuer,
             configuration_id,
@@ -5574,6 +5565,7 @@ mod tests {
                 Some("client_id:citizen-portal"),
                 &["self_attestation"],
             ))),
+            None,
             Json(Oid4vciCredentialRequest {
                 format: SD_JWT_VC_FORMAT.to_string(),
                 credential_identifier: Some("person_is_alive_sd_jwt".to_string()),
@@ -5628,6 +5620,7 @@ mod tests {
                 jwt: proof.clone(),
             },
         };
+        let validated_proof = validated_oid4vci_proof(&state, &proof, Some(nonce));
 
         let response = oid4vci_credential(
             Some(Extension(Arc::clone(&state))),
@@ -5635,6 +5628,7 @@ mod tests {
                 Some("client_id:citizen-portal"),
                 &["self_attestation"],
             ))),
+            Some(Extension(validated_proof.clone())),
             Json(request.clone()),
         )
         .await;
@@ -5659,6 +5653,7 @@ mod tests {
                 Some("client_id:citizen-portal"),
                 &["self_attestation"],
             ))),
+            Some(Extension(validated_proof)),
             Json(request),
         )
         .await;
@@ -5746,12 +5741,18 @@ mod tests {
             )
             .await
             .expect("nonce reserves");
+        let proof = sign_oid4vci_proof(&state.oid4vci.credential_issuer, nonce);
 
         let response = oid4vci_credential(
             Some(Extension(Arc::clone(&state))),
             Some(Extension(fresh_oidc_principal(
                 Some("client_id:citizen-portal"),
                 &["self_attestation"],
+            ))),
+            Some(Extension(validated_oid4vci_proof(
+                &state,
+                &proof,
+                Some(nonce),
             ))),
             Json(Oid4vciCredentialRequest {
                 format: SD_JWT_VC_FORMAT.to_string(),
@@ -5760,7 +5761,7 @@ mod tests {
                 vct: None,
                 proof: registry_platform_oid4vci::CredentialRequestProof {
                     proof_type: PROOF_TYPE_JWT.to_string(),
-                    jwt: sign_oid4vci_proof(&state.oid4vci.credential_issuer, nonce),
+                    jwt: proof,
                 },
             }),
         )
@@ -6872,6 +6873,24 @@ mod tests {
     fn sign_oid4vci_proof(audience: &str, nonce: &str) -> String {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         sign_openid4vci_proof_jwt(&holder_private_jwk(), audience, Some(nonce), now)
+    }
+
+    fn validated_oid4vci_proof(
+        state: &RegistryNotaryApiState,
+        proof: &str,
+        nonce: Option<&str>,
+    ) -> ValidatedProof {
+        validate_proof_jwt(
+            proof,
+            &ProofValidationPolicy::credential_endpoint(
+                &state.oid4vci.credential_issuer,
+                nonce,
+                Duration::from_secs(state.oid4vci.proof.max_age_seconds),
+                Duration::from_secs(state.oid4vci.proof.max_clock_skew_seconds),
+            ),
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .expect("proof validates")
     }
 
     #[cfg(feature = "registry-notary-cel")]
