@@ -15,7 +15,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::Mutex,
     task::JoinHandle,
@@ -496,7 +496,7 @@ impl WorkerPool {
             return Err(WorkerError::CircuitOpen { retry_after });
         }
         let request_line = encode_request(request, self.inner.config.max_request_bytes)?;
-        let Some(mut worker) = self.inner.idle.lock().await.pop_front() else {
+        let Some(mut worker) = self.inner.take_idle_worker_or_replenish().await else {
             return Err(WorkerError::Saturated {
                 max_workers: self.inner.config.max_workers,
             });
@@ -600,6 +600,20 @@ impl WorkerPoolInner {
                 error!(error = ?error, "failed to replace worker process");
             }
         }
+    }
+
+    async fn take_idle_worker_or_replenish(&self) -> Option<Worker> {
+        if let Some(worker) = self.idle.lock().await.pop_front() {
+            return Some(worker);
+        }
+        let current_workers = self.in_flight.load(Ordering::Relaxed);
+        if current_workers >= self.config.max_workers {
+            return None;
+        }
+        for _ in 0..self.config.max_workers - current_workers {
+            self.replace_worker().await;
+        }
+        self.idle.lock().await.pop_front()
     }
 
     async fn circuit_retry_after(&self) -> Option<Duration> {
@@ -759,27 +773,38 @@ impl Worker {
         self.stderr.reset().await;
 
         let response = time::timeout(timeout, async {
-            self.stdin
-                .write_all(request_line)
-                .await
-                .map_err(|source| self.io_error(source, CapturedOutput::empty()))?;
-            self.stdin
-                .flush()
-                .await
-                .map_err(|source| self.io_error(source, CapturedOutput::empty()))?;
+            let worker_id = self.id;
+            let stdin = &mut self.stdin;
+            let stdout = &mut self.stdout;
+            let write_request = async {
+                stdin.write_all(request_line).await?;
+                stdin.flush().await
+            };
+            let read_response = async { read_line_capped(stdout, stdout_limit).await };
+            let (_, line) = tokio::try_join!(
+                async {
+                    write_request.await.map_err(|source| {
+                        worker_io_error(worker_id, source, CapturedOutput::empty())
+                    })
+                },
+                async { Ok::<_, WorkerError>(read_response.await) },
+            )?;
 
-            match read_line_capped(&mut self.stdout, stdout_limit).await {
-                Ok(Some(line)) => serde_json::from_slice(line.trim_ascii_end())
-                    .map_err(|source| self.invalid_output(source, CapturedOutput::empty())),
+            match line {
+                Ok(Some(line)) => serde_json::from_slice(line.trim_ascii_end()).map_err(|source| {
+                    worker_invalid_output(worker_id, source, CapturedOutput::empty())
+                }),
                 Ok(None) => {
                     let status = self.child.wait().await.ok();
-                    Err(self.worker_exited(status, CapturedOutput::empty()))
+                    Err(worker_exited(worker_id, status, CapturedOutput::empty()))
                 }
-                Err(ReadLineError::TooLarge) => {
-                    Err(self.stdout_too_large(stdout_limit, CapturedOutput::empty()))
-                }
+                Err(ReadLineError::TooLarge) => Err(worker_stdout_too_large(
+                    worker_id,
+                    stdout_limit,
+                    CapturedOutput::empty(),
+                )),
                 Err(ReadLineError::Io(source)) => {
-                    Err(self.io_error(source, CapturedOutput::empty()))
+                    Err(worker_io_error(worker_id, source, CapturedOutput::empty()))
                 }
             }
         })
@@ -825,45 +850,53 @@ impl Worker {
         let _ = (&mut self.stderr_task).await;
         self.stderr.snapshot().await
     }
+}
 
-    fn stdout_too_large(&self, limit: usize, stderr: CapturedOutput) -> WorkerError {
-        WorkerError::StdoutTooLarge {
-            worker_id: self.id,
-            limit,
-            stderr_len: stderr.len(),
-            stderr_truncated: stderr.is_truncated(),
-            stderr,
-        }
+fn worker_stdout_too_large(worker_id: u64, limit: usize, stderr: CapturedOutput) -> WorkerError {
+    WorkerError::StdoutTooLarge {
+        worker_id,
+        limit,
+        stderr_len: stderr.len(),
+        stderr_truncated: stderr.is_truncated(),
+        stderr,
     }
+}
 
-    fn invalid_output(&self, source: serde_json::Error, stderr: CapturedOutput) -> WorkerError {
-        WorkerError::InvalidOutput {
-            worker_id: self.id,
-            source,
-            stderr_len: stderr.len(),
-            stderr_truncated: stderr.is_truncated(),
-            stderr,
-        }
+fn worker_invalid_output(
+    worker_id: u64,
+    source: serde_json::Error,
+    stderr: CapturedOutput,
+) -> WorkerError {
+    WorkerError::InvalidOutput {
+        worker_id,
+        source,
+        stderr_len: stderr.len(),
+        stderr_truncated: stderr.is_truncated(),
+        stderr,
     }
+}
 
-    fn worker_exited(&self, status: Option<ExitStatus>, stderr: CapturedOutput) -> WorkerError {
-        WorkerError::WorkerExited {
-            worker_id: self.id,
-            status,
-            stderr_len: stderr.len(),
-            stderr_truncated: stderr.is_truncated(),
-            stderr,
-        }
+fn worker_exited(
+    worker_id: u64,
+    status: Option<ExitStatus>,
+    stderr: CapturedOutput,
+) -> WorkerError {
+    WorkerError::WorkerExited {
+        worker_id,
+        status,
+        stderr_len: stderr.len(),
+        stderr_truncated: stderr.is_truncated(),
+        stderr,
     }
+}
 
-    fn io_error(&self, source: io::Error, stderr: CapturedOutput) -> WorkerError {
-        WorkerError::Io {
-            worker_id: self.id,
-            source,
-            stderr_len: stderr.len(),
-            stderr_truncated: stderr.is_truncated(),
-            stderr,
-        }
+fn worker_io_error(worker_id: u64, source: io::Error, stderr: CapturedOutput) -> WorkerError {
+    WorkerError::Io {
+        worker_id,
+        source,
+        stderr_len: stderr.len(),
+        stderr_truncated: stderr.is_truncated(),
+        stderr,
     }
 }
 
@@ -1024,13 +1057,14 @@ fn encode_request(
     Ok(line)
 }
 
+#[derive(Debug)]
 enum ReadLineError {
     TooLarge,
     Io(io::Error),
 }
 
 async fn read_line_capped(
-    stdout: &mut BufReader<ChildStdout>,
+    stdout: &mut (impl AsyncBufRead + Unpin),
     limit: usize,
 ) -> Result<Option<Vec<u8>>, ReadLineError> {
     let mut line = Vec::new();
@@ -1045,13 +1079,14 @@ async fn read_line_capped(
             };
         }
 
-        let consumed = if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            newline + 1
-        } else {
-            buffer.len()
-        };
+        let (consumed, payload_bytes) =
+            if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                (newline + 1, newline)
+            } else {
+                (buffer.len(), buffer.len())
+            };
 
-        if line.len() + consumed > limit {
+        if line.len() + payload_bytes > limit {
             return Err(ReadLineError::TooLarge);
         }
 
@@ -1061,5 +1096,30 @@ async fn read_line_capped(
         if line.last() == Some(&b'\n') {
             return Ok(Some(line));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn read_line_capped_allows_newline_after_exact_payload_limit() {
+        let mut reader = BufReader::new(&b"abcd\n"[..]);
+        let line = read_line_capped(&mut reader, 4)
+            .await
+            .expect("line read succeeds")
+            .expect("line exists");
+        assert_eq!(line, b"abcd\n");
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_payload_over_limit() {
+        let mut reader = BufReader::new(&b"abcde\n"[..]);
+        assert!(matches!(
+            read_line_capped(&mut reader, 4).await,
+            Err(ReadLineError::TooLarge)
+        ));
     }
 }
