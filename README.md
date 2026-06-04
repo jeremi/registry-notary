@@ -319,10 +319,6 @@ snapshots may publish `snapshot`, `snapshot-YYYYMMDD`, and
 `snapshot-<shortsha>` unless both existing snapshot images already point at the
 current `main` revision. Deployments should consume specific version tags, such
 as `vX.Y.Z`, or immutable digests for rollback.
-=======
-current `main` revision. Deployments should consume specific version tags, such
-as `vX.Y.Z`, or immutable digests for rollback.
->>>>>>> ccde02b (Clarify stable image pinning guidance)
 
 Native runs default to `127.0.0.1:8081`. The Docker image sets
 `REGISTRY_NOTARY_BIND=0.0.0.0:8080` and exposes port `8080`; override it with
