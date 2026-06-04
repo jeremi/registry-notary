@@ -316,8 +316,8 @@ The product container workflow publishes release images only from stable
 and `main` pushes build validation images with both CEL and PKCS#11 compiled
 in, but do not push those validation images. Nightly or manual development
 snapshots may publish `snapshot`, `snapshot-YYYYMMDD`, and
-`snapshot-<shortsha>` unless both existing snapshots already point at the
-current `main` revision. Deployments should consume stable release tags or
+`snapshot-<shortsha>` unless both existing snapshot images already point at the
+current `main` revision.
 immutable digests for rollback.
 
 Native runs default to `127.0.0.1:8081`. The Docker image sets
