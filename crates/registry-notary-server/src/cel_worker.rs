@@ -557,12 +557,12 @@ pub fn cel_expression_uses_regex(expression: &str) -> bool {
     }
     cel_function_calls(expression).into_iter().any(|call| {
         let final_segment = call.rsplit('.').next().unwrap_or(call.as_str());
-        if final_segment == "matches" {
-            return true;
-        }
         matches!(
-            call.replace('.', "_").as_str(),
-            "text_matches"
+            final_segment,
+            "matches"
+                | "regex_replace"
+                | "regex_extract"
+                | "text_matches"
                 | "text_regex_replace"
                 | "text_regex_extract"
                 | "validate_matches"
@@ -625,8 +625,7 @@ fn is_cel_identifier_continue_byte(byte: u8) -> bool {
 }
 
 fn validate_worker_json_limits(value: &Value, limits: &CelWorkerLimits) -> Result<(), ()> {
-    let bytes = serde_json::to_vec(value).map_err(|_| ())?;
-    if bytes.len() > limits.max_binding_json_bytes {
+    if serialized_json_len(value)? > limits.max_binding_json_bytes {
         return Err(());
     }
     let mut stack = vec![(value, 0_usize)];
@@ -656,4 +655,28 @@ fn validate_worker_json_limits(value: &Value, limits: &CelWorkerLimits) -> Resul
         }
     }
     Ok(())
+}
+
+fn serialized_json_len(value: &Value) -> Result<usize, ()> {
+    struct CountingWriter {
+        count: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.count = self
+                .count
+                .checked_add(buf.len())
+                .ok_or_else(|| std::io::Error::other("serialized JSON length overflow"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter { count: 0 };
+    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
+    Ok(writer.count)
 }

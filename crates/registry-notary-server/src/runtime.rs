@@ -3185,8 +3185,7 @@ fn validate_cel_binding_limits(
     value: &Value,
     config: &RegistryNotaryCelConfig,
 ) -> Result<(), EvidenceError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| EvidenceError::RuleEvaluationFailed)?;
-    if bytes.len() > config.max_binding_json_bytes {
+    if serialized_json_len(value)? > config.max_binding_json_bytes {
         return Err(EvidenceError::RuleEvaluationFailed);
     }
     let mut stack = vec![(value, 0_usize)];
@@ -3226,11 +3225,35 @@ fn validate_cel_result_limits(
     config: &RegistryNotaryCelConfig,
 ) -> Result<(), EvidenceError> {
     validate_cel_binding_limits(value, config)?;
-    let bytes = serde_json::to_vec(value).map_err(|_| EvidenceError::RuleEvaluationFailed)?;
-    if bytes.len() > config.max_result_json_bytes {
+    if serialized_json_len(value)? > config.max_result_json_bytes {
         return Err(EvidenceError::RuleEvaluationFailed);
     }
     Ok(())
+}
+
+#[cfg(feature = "registry-notary-cel")]
+fn serialized_json_len(value: &Value) -> Result<usize, EvidenceError> {
+    struct CountingWriter {
+        count: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.count = self
+                .count
+                .checked_add(buf.len())
+                .ok_or_else(|| std::io::Error::other("serialized JSON length overflow"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter { count: 0 };
+    serde_json::to_writer(&mut writer, value).map_err(|_| EvidenceError::RuleEvaluationFailed)?;
+    Ok(writer.count)
 }
 
 #[cfg(feature = "registry-notary-cel")]
@@ -4557,6 +4580,12 @@ mod tests {
         ));
         assert!(cel_expression_uses_regex(
             "text.regex_replace(source.person.name, '^A', 'B')"
+        ));
+        assert!(cel_expression_uses_regex(
+            "text . regex_replace(source.person.name, '^A', 'B')"
+        ));
+        assert!(cel_expression_uses_regex(
+            "text. regex_extract(source.person.name, '^(.+)$', 1)"
         ));
         assert!(cel_expression_uses_regex(
             "text_regex_extract(source.person.name, '^(.+)$', 1)"

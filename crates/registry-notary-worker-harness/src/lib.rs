@@ -426,6 +426,7 @@ pub struct WorkerPool {
 struct WorkerPoolInner {
     config: WorkerPoolConfig,
     idle: Mutex<VecDeque<Worker>>,
+    replenish: Mutex<()>,
     next_worker_id: AtomicU64,
     in_flight: AtomicUsize,
     completed_total: AtomicU64,
@@ -463,6 +464,7 @@ impl WorkerPool {
         let inner = Arc::new(WorkerPoolInner {
             config,
             idle: Mutex::new(VecDeque::new()),
+            replenish: Mutex::new(()),
             next_worker_id: AtomicU64::new(1),
             in_flight: AtomicUsize::new(0),
             completed_total: AtomicU64::new(0),
@@ -496,12 +498,12 @@ impl WorkerPool {
             return Err(WorkerError::CircuitOpen { retry_after });
         }
         let request_line = encode_request(request, self.inner.config.max_request_bytes)?;
-        let Some(mut worker) = self.inner.take_idle_worker_or_replenish().await else {
+        let Some((mut worker, _in_flight)) = self.inner.take_idle_worker_or_replenish().await
+        else {
             return Err(WorkerError::Saturated {
                 max_workers: self.inner.config.max_workers,
             });
         };
-        let _in_flight = InFlightGuard::new(self.inner.clone()).await;
         let worker_id = worker.id;
 
         let result = worker
@@ -559,16 +561,22 @@ impl WorkerPool {
             *idle = running_workers;
         }
 
-        for _ in 0..missing_workers {
-            self.inner.replace_worker().await;
+        let mut replaced_missing_worker = false;
+        if missing_workers > 0 {
+            let _replenish = self.inner.replenish.lock().await;
+            for _ in 0..missing_workers {
+                self.inner.replace_worker().await;
+                replaced_missing_worker = true;
+            }
         }
 
-        if missing_workers > 0 {
+        if replaced_missing_worker {
             return false;
         }
         let snapshot = self.snapshot().await;
         let current_workers = snapshot.idle_workers + snapshot.in_flight;
         if current_workers < snapshot.max_workers {
+            let _replenish = self.inner.replenish.lock().await;
             for _ in 0..snapshot.max_workers - current_workers {
                 self.inner.replace_worker().await;
             }
@@ -602,9 +610,15 @@ impl WorkerPoolInner {
         }
     }
 
-    async fn take_idle_worker_or_replenish(&self) -> Option<Worker> {
+    async fn take_idle_worker_or_replenish(self: &Arc<Self>) -> Option<(Worker, InFlightGuard)> {
         if let Some(worker) = self.idle.lock().await.pop_front() {
-            return Some(worker);
+            let in_flight = InFlightGuard::new(self.clone()).await;
+            return Some((worker, in_flight));
+        }
+        let _replenish = self.replenish.lock().await;
+        if let Some(worker) = self.idle.lock().await.pop_front() {
+            let in_flight = InFlightGuard::new(self.clone()).await;
+            return Some((worker, in_flight));
         }
         let current_workers = self.in_flight.load(Ordering::Relaxed);
         if current_workers >= self.config.max_workers {
@@ -613,7 +627,9 @@ impl WorkerPoolInner {
         for _ in 0..self.config.max_workers - current_workers {
             self.replace_worker().await;
         }
-        self.idle.lock().await.pop_front()
+        let worker = self.idle.lock().await.pop_front()?;
+        let in_flight = InFlightGuard::new(self.clone()).await;
+        Some((worker, in_flight))
     }
 
     async fn circuit_retry_after(&self) -> Option<Duration> {
@@ -780,31 +796,36 @@ impl Worker {
                 stdin.write_all(request_line).await?;
                 stdin.flush().await
             };
-            let read_response = async { read_line_capped(stdout, stdout_limit).await };
+            let read_response = async {
+                read_line_capped(stdout, stdout_limit)
+                    .await
+                    .map_err(|error| match error {
+                        ReadLineError::TooLarge => worker_stdout_too_large(
+                            worker_id,
+                            stdout_limit,
+                            CapturedOutput::empty(),
+                        ),
+                        ReadLineError::Io(source) => {
+                            worker_io_error(worker_id, source, CapturedOutput::empty())
+                        }
+                    })
+            };
             let (_, line) = tokio::try_join!(
                 async {
                     write_request.await.map_err(|source| {
                         worker_io_error(worker_id, source, CapturedOutput::empty())
                     })
                 },
-                async { Ok::<_, WorkerError>(read_response.await) },
+                read_response,
             )?;
 
             match line {
-                Ok(Some(line)) => serde_json::from_slice(line.trim_ascii_end()).map_err(|source| {
+                Some(line) => serde_json::from_slice(line.trim_ascii_end()).map_err(|source| {
                     worker_invalid_output(worker_id, source, CapturedOutput::empty())
                 }),
-                Ok(None) => {
+                None => {
                     let status = self.child.wait().await.ok();
                     Err(worker_exited(worker_id, status, CapturedOutput::empty()))
-                }
-                Err(ReadLineError::TooLarge) => Err(worker_stdout_too_large(
-                    worker_id,
-                    stdout_limit,
-                    CapturedOutput::empty(),
-                )),
-                Err(ReadLineError::Io(source)) => {
-                    Err(worker_io_error(worker_id, source, CapturedOutput::empty()))
                 }
             }
         })
