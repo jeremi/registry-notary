@@ -1,15 +1,15 @@
 # Security Assurance
 
 Registry Notary's container workflow publishes stable images only from
-`vX.Y.Z` tags under `ghcr.io/jeremi/registry-notary` and
+`vX.Y.Z` tags to `ghcr.io/jeremi/registry-notary` and
 `ghcr.io/jeremi/registry-notary-openfn-sidecar`. Release tags also update
 `vX.Y`, `vX`, and `latest`; `latest` means latest stable release. Pull requests
 and `main` pushes build local validation images for smoke, SBOM, and Grype
 evidence, but do not push GHCR tags. Nightly or manual development snapshots
 publish `snapshot`, `snapshot-YYYYMMDD`, and `snapshot-<shortsha>` unless both
 existing `snapshot` images' `org.opencontainers.image.revision` labels already
-match current `main`. Final deployments should pin the selected images by
-digest.
+match the current `main` revision. Final deployments should pin the selected
+images by digest.
 
 The Registry Notary image is built with CEL and PKCS#11 compiled in. Runtime
 use remains config-gated, and the image is covered by the CEL worker-protocol
@@ -55,8 +55,9 @@ and must be committed intentionally with review.
 ## Image signing status
 
 Registry Notary release images are not signed with `cosign` or another image
-signature workflow yet. The current release evidence relies on stable release
-tags, digest pinning, SBOM generation, and Grype image vulnerability reports.
+signature workflow yet. The current release evidence relies on immutable
+`vX.Y.Z` tags, digest pinning, SBOM generation, and Grype image vulnerability
+reports.
 Operators should pin the selected image by digest and treat image-signature
 verification as not available for this release.
 
