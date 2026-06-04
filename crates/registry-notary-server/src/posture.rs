@@ -224,13 +224,36 @@ fn default_posture_context() -> PostureContext {
 }
 
 fn config_hash(config: &StandaloneRegistryNotaryConfig) -> String {
-    let bytes = serde_json::to_vec(config).unwrap_or_default();
-    let digest = Sha256::digest(bytes);
-    let hex = digest
+    let value = serde_json::to_value(config).unwrap_or(Value::Null);
+    let bytes = canonical_json_bytes(value);
+    let hex = Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("sha256:{hex}")
+}
+
+fn canonical_json_bytes(mut value: Value) -> Vec<u8> {
+    sort_json(&mut value);
+    serde_json::to_vec(&value).unwrap_or_default()
+}
+
+fn sort_json(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let sorted = std::mem::take(map).into_iter().collect::<BTreeMap<_, _>>();
+            for (key, mut child) in sorted {
+                sort_json(&mut child);
+                map.insert(key, child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sort_json(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn classify_replay_storage(storage: &str) -> String {
@@ -397,7 +420,52 @@ fn service_url(base_url: &str, path: &str) -> Option<String> {
 
 fn production_like(environment: &str) -> bool {
     matches!(
-        environment,
+        environment.to_ascii_lowercase().as_str(),
         "production" | "prod" | "pilot" | "staging" | "production-like"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_json_bytes_sorts_nested_objects() {
+        let left = json!({
+            "b": 1,
+            "a": {
+                "z": true,
+                "y": false
+            },
+            "c": [
+                {
+                    "d": "last",
+                    "a": "first"
+                }
+            ]
+        });
+        let right = json!({
+            "c": [
+                {
+                    "a": "first",
+                    "d": "last"
+                }
+            ],
+            "a": {
+                "y": false,
+                "z": true
+            },
+            "b": 1
+        });
+
+        assert_eq!(canonical_json_bytes(left), canonical_json_bytes(right));
+    }
+
+    #[test]
+    fn production_like_environment_is_case_insensitive() {
+        assert!(production_like("Production"));
+        assert!(production_like("STAGING"));
+        assert!(production_like("production-like"));
+        assert!(!production_like("development"));
+    }
 }
