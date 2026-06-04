@@ -8,7 +8,7 @@ use registry_notary_core::{
     SelfAttestationRateLimitMode, SigningKeyStatus, StandaloneRegistryNotaryConfig,
     CREDENTIAL_STATUS_STORAGE_REDIS, REPLAY_STORAGE_IN_MEMORY, REPLAY_STORAGE_REDIS,
 };
-use registry_platform_ops::{filter_posture_for_tier, PostureTier};
+use registry_platform_ops::{filter_posture_for_tier, PostureFilterError, PostureTier};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -98,7 +98,9 @@ impl PostureContext {
     }
 }
 
-pub(crate) async fn posture_document(state: &RegistryNotaryApiState) -> Value {
+pub(crate) async fn posture_document(
+    state: &RegistryNotaryApiState,
+) -> Result<Value, PostureFilterError> {
     let replay_ready = state.replay.check_ready().await;
     let replay_ready_bool = matches!(replay_ready, Ok(ReplayReadiness::Ready));
     let credential_status_ready = state.credential_status.check_ready().await.is_ok();
@@ -233,7 +235,6 @@ pub(crate) async fn posture_document(state: &RegistryNotaryApiState) -> Value {
         },
     });
     filter_posture_for_tier(posture, PostureTier::Default)
-        .expect("default posture allowlist is a valid platform contract")
 }
 
 fn default_posture_context() -> PostureContext {
@@ -346,9 +347,10 @@ fn source_connection_counts_by_kind(
             let Some(connection) = binding.connection.as_deref() else {
                 continue;
             };
-            if !seen_connections.insert(connection.to_string()) {
+            if seen_connections.contains(connection) {
                 continue;
             }
+            seen_connections.insert(connection.to_string());
             let kind = config
                 .evidence
                 .source_connections
