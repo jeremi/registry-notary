@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Load harness and test tooling for registry-notary performance testing"
 requires-python = ">=3.11"
 dependencies = [
-    "aiohttp>=3.9",
+    "aiohttp>=3.14.0",
     "psutil>=6",
     "pytest>=8",
     "pytest-asyncio>=0.23",
