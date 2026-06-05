@@ -9763,6 +9763,182 @@ async fn admin_config_apply_signed_preauth_signing_rotation_preserves_inflight_t
     idp.stop().await;
 }
 
+#[tokio::test]
+async fn admin_config_apply_signed_preauth_signing_rotation_rejects_extra_esignet_settings() {
+    set_preauth_env();
+    let idp = MockIdp::start().await;
+    let token_upstream = MockHttpUpstream::start().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = preauth_test_config(
+        "http://127.0.0.1:1",
+        audit_path.to_str().expect("audit path is UTF-8"),
+        &idp,
+        &token_upstream,
+    );
+    config
+        .auth
+        .oidc
+        .as_mut()
+        .expect("OIDC config exists")
+        .scope_map
+        .insert(
+            "admin_ops".to_string(),
+            vec![
+                "registry_notary:admin".to_string(),
+                "registry_notary:ops_read".to_string(),
+            ],
+        );
+    add_config_trust(&mut config, antirollback_path.clone());
+
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+
+    std::env::set_var("TEST_ACCESS_TOKEN_JWK_2", TEST_HOLDER_JWK);
+    std::env::set_var("TEST_ESIGNET_RP_JWK_2", TEST_ISSUER_JWK);
+    std::env::set_var(
+        "TEST_ACCESS_TOKEN_JWK_OLD_PUBLIC",
+        public_jwk_env_value(
+            TEST_ACCESS_TOKEN_JWK,
+            "did:web:issuer.example#access-token-key",
+        ),
+    );
+    std::env::set_var(
+        "TEST_ESIGNET_RP_JWK_OLD_PUBLIC",
+        public_jwk_env_value(TEST_ESIGNET_RP_JWK, "did:web:rp.example#esignet-rp-key"),
+    );
+    let mut candidate = config.clone();
+    let publish_until_unix_seconds =
+        u64::try_from((OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp())
+            .unwrap();
+    let old_access_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("access-token-key")
+        .expect("old access-token key exists");
+    old_access_key.status = SigningKeyStatus::PublishOnly;
+    old_access_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_access_key.private_jwk_env.clear();
+    old_access_key.public_jwk_env = "TEST_ACCESS_TOKEN_JWK_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "access-token-key-2".to_string(),
+        local_jwk_signing_key(
+            "TEST_ACCESS_TOKEN_JWK_2",
+            "did:web:issuer.example#access-token-key-2",
+        ),
+    );
+    candidate.auth.access_token_signing.signing_key_id = "access-token-key-2".to_string();
+    candidate.auth.access_token_signing.verification_key_ids = vec!["access-token-key".to_string()];
+
+    let old_esignet_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("esignet-rp-key")
+        .expect("old eSignet RP key exists");
+    old_esignet_key.status = SigningKeyStatus::PublishOnly;
+    old_esignet_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_esignet_key.private_jwk_env.clear();
+    old_esignet_key.public_jwk_env = "TEST_ESIGNET_RP_JWK_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "esignet-rp-key-2".to_string(),
+        local_jwk_signing_key(
+            "TEST_ESIGNET_RP_JWK_2",
+            "did:web:rp.example#esignet-rp-key-2",
+        ),
+    );
+    candidate
+        .oid4vci
+        .pre_authorized_code
+        .esignet
+        .client_signing_key_id = "esignet-rp-key-2".to_string();
+    candidate.oid4vci.pre_authorized_code.esignet.authorize_url =
+        format!("{}/authorize-v2", idp.issuer());
+
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["signing_key_rotation"],
+    )
+    .await;
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let admin_token = idp.mint_token(json!({
+        "sub": "config-admin",
+        "aud": "registry-notary-citizen",
+        "azp": "citizen-portal",
+        "scope": "admin_ops",
+        "iat": OffsetDateTime::now_utc().unix_timestamp(),
+        "exp": OffsetDateTime::now_utc().unix_timestamp() + 300,
+        "nbf": OffsetDateTime::now_utc().unix_timestamp(),
+    }));
+    let authorization = format!("Bearer {admin_token}");
+
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("authorization", authorization.clone())
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(body["result"], json!("rejected_restart_required"));
+    assert_eq!(body["posture_result"], json!("rejected"));
+    assert_eq!(body["applied"], json!(false));
+    assert_eq!(body["restart_required"], json!(true));
+
+    let antirollback = FileAntiRollbackStore::new(&antirollback_path)
+        .load(&AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "registry-notary-standalone".to_string(),
+            environment: "development".to_string(),
+            stream_id: "notary-test-stream".to_string(),
+        })
+        .expect("antirollback state loads after rejection");
+    assert_eq!(antirollback.last_sequence, 1);
+    assert_eq!(antirollback.last_config_hash, current_config_hash);
+
+    let posture = server
+        .get("/admin/v1/posture?tier=restricted")
+        .add_header("authorization", authorization)
+        .await;
+    posture.assert_status_ok();
+    let posture: Value = posture.json();
+    assert_eq!(posture["configuration"]["last_apply_result"], Value::Null);
+    let active_signing_keys = posture["notary"]["signing_keys"]["active"]
+        .as_array()
+        .expect("active signing keys are listed")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(active_signing_keys.contains("access-token-key"));
+    assert!(active_signing_keys.contains("esignet-rp-key"));
+    assert!(!active_signing_keys.contains("access-token-key-2"));
+    assert!(!active_signing_keys.contains("esignet-rp-key-2"));
+
+    let start = server
+        .get("/oid4vci/offer/start?credential_configuration_id=person_is_alive_sd_jwt")
+        .await;
+    start.assert_status(StatusCode::SEE_OTHER);
+    let location = start
+        .headers()
+        .get("location")
+        .expect("redirect location")
+        .to_str()
+        .expect("location is valid");
+    assert!(location.starts_with(&format!("{}/authorize", idp.issuer())));
+    assert!(
+        !location.starts_with(&format!("{}/authorize-v2", idp.issuer())),
+        "restart-required eSignet route-shape change must not swap live runtime"
+    );
+    idp.stop().await;
+}
+
 /// A userinfo-sourced subject binding (`claim_source = userinfo`) reads the
 /// binding claim from the eSignet userinfo JWS, not the `id_token`. This mirrors
 /// the hosted lab, where eSignet delivers `individual_id` only via userinfo.
