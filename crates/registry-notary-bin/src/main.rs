@@ -15,13 +15,19 @@ use axum::extract::MatchedPath;
 use axum::http::Request;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use registry_notary_core::{
     Oauth2ClientCredentialsSourceAuthConfig, SigningKeyProviderConfig, SourceAuthConfig,
     StandaloneRegistryNotaryConfig,
 };
-use registry_notary_server::{openapi_document, standalone_router, EvidenceIssuerRegistry};
+use registry_notary_server::config_governed::{
+    parse_candidate_config, resolve_tuf_config_candidate, ConfigGovernanceContext,
+    LocalTufConfigTargetRequest, TufConfigTargetRequest,
+};
+use registry_notary_server::{
+    compile_notary_runtime, openapi_document, standalone_router, EvidenceIssuerRegistry,
+};
 use registry_platform_crypto::{LocalJwkSigner, PrivateJwk, PublicJwk};
 use registry_platform_httputil::{url as httputil_url, FetchUrlPolicy};
 use serde_json::{json, Value};
@@ -78,6 +84,11 @@ enum Command {
     },
     /// Print resolved config and required env vars.
     ExplainConfig,
+    /// Verify governed runtime configuration bundles without applying them.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Generate starter files.
     Init {
         #[command(subcommand)]
@@ -129,6 +140,31 @@ enum Command {
     BuildInfo,
     /// Print a lightweight JSON schema for top-level config discovery.
     Schema,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Verify a local TUF-profile signed configuration target.
+    VerifyBundle(ConfigVerifyBundleArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct ConfigVerifyBundleArgs {
+    /// Local TUF root metadata path.
+    #[arg(long)]
+    root_path: PathBuf,
+    /// Local TUF metadata directory.
+    #[arg(long)]
+    metadata_dir: PathBuf,
+    /// Local TUF targets directory.
+    #[arg(long)]
+    targets_dir: PathBuf,
+    /// Persistent TUF datastore directory.
+    #[arg(long)]
+    datastore_dir: PathBuf,
+    /// Target filename to verify.
+    #[arg(long)]
+    target_name: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -286,6 +322,15 @@ async fn run(args: Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             explain_config(config_path, &env_report, args.bind)?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Config { command }) => {
+            let config_path = required_config_path(args.config.as_deref())?;
+            match command {
+                ConfigCommand::VerifyBundle(verify_args) => {
+                    config_verify_bundle(config_path, verify_args).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Init { template }) => {
             match template {
                 InitCommand::Dci {
@@ -391,6 +436,45 @@ async fn run_server(
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    Ok(())
+}
+
+async fn config_verify_bundle(
+    config_path: &Path,
+    args: ConfigVerifyBundleArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current_config = load_expanded_config(config_path)?;
+    let request = TufConfigTargetRequest::Local(LocalTufConfigTargetRequest {
+        root_path: args.root_path,
+        metadata_dir: args.metadata_dir,
+        targets_dir: args.targets_dir,
+        datastore_dir: args.datastore_dir,
+        target_name: args.target_name.clone(),
+    });
+    let resolved = resolve_tuf_config_candidate(
+        &request,
+        &ConfigGovernanceContext::from_config(&current_config),
+    )
+    .await?;
+    let candidate_config = parse_candidate_config(&resolved.config_yaml)
+        .map_err(|detail| io::Error::new(io::ErrorKind::InvalidData, detail))?;
+    let _compiled = compile_notary_runtime(candidate_config)?;
+
+    let report = json!({
+        "result": "verified",
+        "source": resolved.source_label(),
+        "target_name": args.target_name,
+        "bundle_id": resolved.bundle_id,
+        "stream_id": resolved.stream_id,
+        "sequence": resolved.sequence,
+        "previous_config_hash": resolved.previous_config_hash,
+        "config_hash": resolved.internal_config_hash(),
+        "root_version": resolved.root_version,
+        "tuf_root_sha256": resolved.tuf_root_sha256,
+        "change_classes": resolved.change_classes.into_iter().collect::<Vec<_>>(),
+        "signer_kids": resolved.signer_kids.into_iter().collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -2179,6 +2263,78 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
     }
 
     #[test]
+    fn config_verify_bundle_cli_accepts_local_tuf_flags() {
+        let args = Args::try_parse_from([
+            "registry-notary",
+            "--config",
+            "/etc/registry-notary/current.yaml",
+            "config",
+            "verify-bundle",
+            "--root-path",
+            "/etc/registry-notary/tuf/metadata/1.root.json",
+            "--metadata-dir",
+            "/etc/registry-notary/tuf/metadata",
+            "--targets-dir",
+            "/etc/registry-notary/tuf/targets",
+            "--datastore-dir",
+            "/var/lib/registry-notary/tuf",
+            "--target-name",
+            "registry-notary.yaml",
+        ])
+        .expect("args parse");
+
+        assert_eq!(
+            args.config,
+            Some(PathBuf::from("/etc/registry-notary/current.yaml"))
+        );
+        let Some(Command::Config {
+            command: ConfigCommand::VerifyBundle(command),
+        }) = args.command
+        else {
+            panic!("expected config verify-bundle command");
+        };
+        assert_eq!(
+            command.root_path,
+            PathBuf::from("/etc/registry-notary/tuf/metadata/1.root.json")
+        );
+        assert_eq!(
+            command.metadata_dir,
+            PathBuf::from("/etc/registry-notary/tuf/metadata")
+        );
+        assert_eq!(
+            command.targets_dir,
+            PathBuf::from("/etc/registry-notary/tuf/targets")
+        );
+        assert_eq!(
+            command.datastore_dir,
+            PathBuf::from("/var/lib/registry-notary/tuf")
+        );
+        assert_eq!(command.target_name, "registry-notary.yaml");
+    }
+
+    #[test]
+    fn config_verify_bundle_cli_requires_target_name() {
+        let err = Args::try_parse_from([
+            "registry-notary",
+            "--config",
+            "/etc/registry-notary/current.yaml",
+            "config",
+            "verify-bundle",
+            "--root-path",
+            "/etc/registry-notary/tuf/metadata/1.root.json",
+            "--metadata-dir",
+            "/etc/registry-notary/tuf/metadata",
+            "--targets-dir",
+            "/etc/registry-notary/tuf/targets",
+            "--datastore-dir",
+            "/var/lib/registry-notary/tuf",
+        ])
+        .expect_err("missing target-name is rejected");
+
+        assert!(err.to_string().contains("--target-name"));
+    }
+
+    #[test]
     fn build_info_reports_compiled_pkcs11_capability() {
         let info = build_info();
         assert_eq!(info["package"], "registry-notary-bin");
@@ -2397,6 +2553,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
                 alg: "EdDSA".to_string(),
                 kid: "did:web:issuer.example#hsm".to_string(),
                 status: registry_notary_core::SigningKeyStatus::Active,
+                publish_until_unix_seconds: None,
                 private_jwk_env: String::new(),
                 public_jwk_env: "TEST_DOCTOR_PKCS11_PUBLIC_JWK".to_string(),
                 module_path: "/definitely/missing/pkcs11.so".to_string(),

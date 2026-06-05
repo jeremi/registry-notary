@@ -8,6 +8,7 @@
 pub mod api;
 #[cfg(feature = "registry-notary-cel")]
 pub mod cel_worker;
+pub mod config_governed;
 pub(crate) mod credential_status;
 pub(crate) mod federation;
 pub(crate) mod metrics;

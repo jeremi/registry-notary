@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -28,20 +27,17 @@ use registry_notary_core::RegistryNotaryCelConfig;
 use registry_notary_core::{
     AccessMode, BatchEvaluateItemRequest, BatchEvaluateRequest, BoundedClaimId,
     BoundedCorrelationId, ClaimRef, ClaimResultView, ClaimSet, ConfigAuditEvent, ConfigMetadata,
-    ConfigTrustConfig, CredentialIssueRequest, CredentialProfileConfig, EvaluateRequest,
-    EvidenceBatchItemAuditEvent, EvidenceConfig, EvidenceEntity, EvidenceEntityReference,
-    EvidenceError, EvidencePrincipal, EvidenceRelationship, FederationConfig, Hashed,
-    HolderRequest, Oid4vciConfig, Oid4vciCredentialConfigurationConfig, Oid4vciDisplayImageConfig,
-    Oid4vciIssuerDisplayConfig, PolicyIdentifier, RateLimitBucket, RenderEvaluationRequest,
-    SelfAttestationConfig, SelfAttestationDenialCode, SelfAttestationScopePolicy, SigningKeyStatus,
-    SourceCapability, StandaloneRegistryNotaryConfig, StoredSelfAttestationMetadata,
-    SubjectRequest, VerifiedClaimValue, FORMAT_CLAIM_RESULT_JSON, FORMAT_SD_JWT_VC,
+    CredentialIssueRequest, CredentialProfileConfig, EvaluateRequest, EvidenceBatchItemAuditEvent,
+    EvidenceConfig, EvidenceEntity, EvidenceEntityReference, EvidenceError, EvidencePrincipal,
+    EvidenceRelationship, FederationConfig, Hashed, HolderRequest, Oid4vciConfig,
+    Oid4vciCredentialConfigurationConfig, Oid4vciDisplayImageConfig, Oid4vciIssuerDisplayConfig,
+    PolicyIdentifier, RateLimitBucket, RenderEvaluationRequest, SelfAttestationConfig,
+    SelfAttestationDenialCode, SelfAttestationScopePolicy, SigningKeyStatus, SourceCapability,
+    StandaloneRegistryNotaryConfig, StoredSelfAttestationMetadata, SubjectRequest,
+    VerifiedClaimValue, FORMAT_CLAIM_RESULT_JSON, FORMAT_SD_JWT_VC,
 };
 use registry_platform_audit::AuditKeyHasher;
-use registry_platform_config::{
-    LocalTufRepositoryInput, RegistryTrustRoot, RemoteTufRepositoryInput, TufConfigVerifier,
-    VerificationContext,
-};
+use registry_platform_config::RegistryTrustRoot;
 use registry_platform_crypto::KeyReadiness;
 use registry_platform_crypto::PublicJwk;
 use registry_platform_crypto::SigningProvider;
@@ -69,6 +65,10 @@ use time::OffsetDateTime;
 
 #[cfg(feature = "registry-notary-cel")]
 use crate::cel_worker::CelWorker;
+use crate::config_governed::{
+    is_signed_config_source, parse_candidate_config, resolve_tuf_config_candidate,
+    ConfigCandidateError, ConfigGovernanceContext, ResolvedConfigCandidate, TufConfigTargetRequest,
+};
 use crate::{
     credential_profile_for,
     credential_status::{is_mutable_status, CredentialStatusStore},
@@ -172,47 +172,6 @@ struct ConfigApplyRequest {
     local_approval_reference: Option<String>,
     #[serde(default)]
     tuf: Option<TufConfigTargetRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TufConfigTargetRequest {
-    Local(LocalTufConfigTargetRequest),
-    Remote(RemoteTufConfigTargetRequest),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LocalTufConfigTargetRequest {
-    root_path: PathBuf,
-    metadata_dir: PathBuf,
-    targets_dir: PathBuf,
-    datastore_dir: PathBuf,
-    target_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteTufConfigTargetRequest {
-    root_path: PathBuf,
-    metadata_base_url: String,
-    targets_base_url: String,
-    datastore_dir: PathBuf,
-    target_name: String,
-    #[serde(default)]
-    allow_dev_insecure_fetch_urls: bool,
-}
-
-struct ResolvedConfigCandidate {
-    bundle_id: String,
-    stream_id: String,
-    sequence: u64,
-    previous_config_hash: Option<String>,
-    root_version: Option<u64>,
-    change_classes: BTreeSet<String>,
-    signer_kids: BTreeSet<String>,
-    config_yaml: String,
-    source: ConfigSource,
 }
 
 #[derive(Clone, Debug)]
@@ -955,17 +914,6 @@ fn require_admin_scope_error(principal: Option<Extension<EvidencePrincipal>>) ->
     None
 }
 
-fn parse_candidate_config(
-    config_yaml: &str,
-) -> Result<StandaloneRegistryNotaryConfig, &'static str> {
-    let config: StandaloneRegistryNotaryConfig =
-        serde_norway::from_str(config_yaml).map_err(|_| "candidate config could not be parsed")?;
-    config
-        .validate()
-        .map_err(|_| "candidate config did not validate")?;
-    Ok(config)
-}
-
 struct CredentialIssuerRotation {
     issuers: Arc<dyn EvidenceIssuerResolver>,
     signer_readiness: SignerReadiness,
@@ -1004,13 +952,6 @@ enum RootTransitionError {
 fn root_transition_authorized(candidate: &ResolvedConfigCandidate) -> bool {
     is_signed_config_source(candidate.source)
         && candidate.change_classes.contains("root_transition")
-}
-
-fn is_signed_config_source(source: ConfigSource) -> bool {
-    matches!(
-        source,
-        ConfigSource::SignedBundleFile | ConfigSource::SignedBundleEndpoint
-    )
 }
 
 fn classify_root_transition(
@@ -1475,11 +1416,6 @@ fn old_key_is_safe_for_rotation(
     Ok(())
 }
 
-enum ConfigCandidateError {
-    CandidateInvalid(&'static str),
-    BundleInvalid(&'static str),
-}
-
 async fn resolve_config_candidate(
     request: &ConfigApplyRequest,
     state: &RegistryNotaryApiState,
@@ -1509,100 +1445,16 @@ async fn resolve_config_candidate(
                 root_version: request.root_version,
                 change_classes: BTreeSet::new(),
                 signer_kids: BTreeSet::new(),
+                tuf_root_sha256: None,
                 config_yaml: config_yaml.clone(),
                 source: ConfigSource::LocalFile,
             })
         }
-        (None, Some(tuf)) => resolve_tuf_config_candidate(tuf, state).await,
+        (None, Some(tuf)) => resolve_tuf_config_candidate(tuf, &state.config_governance()).await,
         (None, None) => Err(ConfigCandidateError::CandidateInvalid(
             "candidate config source was not provided",
         )),
     }
-}
-
-async fn resolve_tuf_config_candidate(
-    request: &TufConfigTargetRequest,
-    state: &RegistryNotaryApiState,
-) -> Result<ResolvedConfigCandidate, ConfigCandidateError> {
-    let config_governance = state.config_governance();
-    let Some(config_trust) = &config_governance.config_trust else {
-        return Err(ConfigCandidateError::BundleInvalid(
-            "signed config trust roots are not configured",
-        ));
-    };
-    if config_trust.accepted_roots.is_empty() {
-        return Err(ConfigCandidateError::BundleInvalid(
-            "signed config trust roots are not configured",
-        ));
-    }
-    let context = VerificationContext {
-        product: "registry-notary".to_string(),
-        instance_id: config_governance.instance_id.clone(),
-        environment: config_governance.environment.clone(),
-    };
-    let (verified, source) = match request {
-        TufConfigTargetRequest::Local(request) => {
-            let input = LocalTufRepositoryInput {
-                root_path: request.root_path.clone(),
-                metadata_dir: request.metadata_dir.clone(),
-                targets_dir: request.targets_dir.clone(),
-                datastore_dir: request.datastore_dir.clone(),
-                target_name: request.target_name.clone(),
-            };
-            let verified = TufConfigVerifier::verify_config_target(&input, &context)
-                .await
-                .map_err(|_| {
-                    ConfigCandidateError::BundleInvalid(
-                        "signed config target could not be verified",
-                    )
-                })?;
-            (verified, ConfigSource::SignedBundleFile)
-        }
-        TufConfigTargetRequest::Remote(request) => {
-            let input = RemoteTufRepositoryInput {
-                root_path: request.root_path.clone(),
-                metadata_base_url: request.metadata_base_url.clone(),
-                targets_base_url: request.targets_base_url.clone(),
-                datastore_dir: request.datastore_dir.clone(),
-                target_name: request.target_name.clone(),
-                allow_dev_insecure_fetch_urls: request.allow_dev_insecure_fetch_urls,
-            };
-            let verified = TufConfigVerifier::verify_remote_config_target(&input, &context)
-                .await
-                .map_err(|_| {
-                    ConfigCandidateError::BundleInvalid(
-                        "signed config target could not be verified",
-                    )
-                })?;
-            (verified, ConfigSource::SignedBundleEndpoint)
-        }
-    };
-    if !config_trust.accepted_roots.iter().any(|root| {
-        root.authorize(
-            &verified.metadata.change_classes,
-            &verified.tuf.signer_kids,
-            &verified.tuf.root_sha256,
-        )
-        .is_ok()
-    }) {
-        return Err(ConfigCandidateError::BundleInvalid(
-            "signed config target was not authorized by local trust roots",
-        ));
-    }
-    let config_yaml = String::from_utf8(verified.tuf.target_bytes).map_err(|_| {
-        ConfigCandidateError::CandidateInvalid("candidate config payload is not valid UTF-8")
-    })?;
-    Ok(ResolvedConfigCandidate {
-        bundle_id: verified.metadata.bundle_id,
-        stream_id: verified.metadata.stream_id,
-        sequence: verified.metadata.sequence,
-        previous_config_hash: verified.metadata.previous_config_hash,
-        root_version: Some(verified.tuf.root_version),
-        change_classes: verified.metadata.change_classes,
-        signer_kids: verified.tuf.signer_kids.into_iter().collect(),
-        config_yaml,
-        source,
-    })
 }
 
 fn consume_apply_metadata(request: &ConfigApplyRequest) {
@@ -2277,33 +2129,6 @@ pub struct RegistryNotaryApiState {
 struct IssuerRuntimeBundle {
     issuers: Arc<dyn EvidenceIssuerResolver>,
     signer_readiness: SignerReadiness,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ConfigGovernanceContext {
-    instance_id: String,
-    environment: String,
-    config_trust: Option<ConfigTrustConfig>,
-}
-
-impl ConfigGovernanceContext {
-    pub(crate) fn from_config(config: &StandaloneRegistryNotaryConfig) -> Self {
-        Self {
-            instance_id: config.instance.id.clone(),
-            environment: config.instance.environment.clone(),
-            config_trust: config.config_trust.clone(),
-        }
-    }
-}
-
-impl Default for ConfigGovernanceContext {
-    fn default() -> Self {
-        Self {
-            instance_id: "registry-notary-standalone".to_string(),
-            environment: "development".to_string(),
-            config_trust: None,
-        }
-    }
 }
 
 impl RegistryNotaryApiState {

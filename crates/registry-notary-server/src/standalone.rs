@@ -63,7 +63,8 @@ use crate::cel_worker::{CelWorker, CelWorkerConfig};
 #[cfg(feature = "registry-notary-cel")]
 use crate::runtime::validate_cel_claims_for_startup;
 use crate::{
-    api::{ConfigGovernanceContext, ADMIN_SCOPE},
+    api::ADMIN_SCOPE,
+    config_governed::ConfigGovernanceContext,
     credential_status::{CredentialStatusBuildError, CredentialStatusStore},
     metrics::{metrics_handler, metrics_middleware, AppMetrics},
     posture::PostureContext,
