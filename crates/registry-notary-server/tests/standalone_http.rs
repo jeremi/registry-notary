@@ -448,6 +448,7 @@ fn initialize_notary_antirollback_state(path: &std::path::Path, config_yaml: &st
             last_config_hash: internal_config_hash(config_yaml.as_bytes()),
             root_version: None,
             break_glass: Default::default(),
+            local_approvals: Default::default(),
         })
         .expect("anti-rollback state initializes");
 }
