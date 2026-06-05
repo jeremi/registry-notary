@@ -100,6 +100,11 @@ evidence:
 restricted posture `notary.signing_keys.publish_only`. Publish-only keys cannot
 be referenced by `credential_profiles.*.signing_key`.
 
+Governed signed config apply can remove expired publish-only keys with change
+class `signing_key_cleanup` once they are no longer active signing references.
+Cleanup before `publish_until_unix_seconds` has elapsed is rejected before
+anti-rollback advances.
+
 ## Federation Response Signing
 
 Federation response JWTs use the same provider abstraction as credential
@@ -132,7 +137,9 @@ public key id.
 3. Move the old key to `publish_only` and configure only `public_jwk_env`.
 4. Set `publish_until_unix_seconds` to the end of the verifier window, or omit
    it for an indefinite manual window.
-5. Change the old key to `disabled` and remove its secret material.
+5. After the verifier window ends, remove the old key with governed
+   `signing_key_cleanup`, or change it to `disabled` during the next local-file
+   deploy when running without signed apply.
 
 Do not reuse a `kid` for new key material. Verifiers cache keys by `kid`, and
 reuse creates ambiguous verification behavior.

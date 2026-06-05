@@ -128,9 +128,11 @@ authorization even when TUF verification and signer quorum otherwise succeed.
 `POST /admin/v1/config/apply` can hot-apply governed signed signing-key
 rotations for credential issuer, pre-authorized access-token, eSignet
 client-assertion, and federation response signing paths after TUF verification,
-trust-root authorization, and local anti-rollback acceptance. Other changes
-continue to reject with `rejected_restart_required`, so rejected signed targets
-do not advance anti-rollback state or change active posture provenance.
+trust-root authorization, and local anti-rollback acceptance. It can also
+hot-apply `signing_key_cleanup` for expired publish-only keys that are no longer
+active signing references. Other changes continue to reject with
+`rejected_restart_required`, so rejected signed targets do not advance
+anti-rollback state or change active posture provenance.
 Break-glass apply is
 available only for signed targets whose target metadata includes the local
 approval's `emergency_change_class`; the approval record, expiry, and

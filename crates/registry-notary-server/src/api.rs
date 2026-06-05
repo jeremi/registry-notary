@@ -33,9 +33,9 @@ use registry_notary_core::{
     EvidenceError, EvidencePrincipal, EvidenceRelationship, FederationConfig, Hashed,
     HolderRequest, Oid4vciConfig, Oid4vciCredentialConfigurationConfig, Oid4vciDisplayImageConfig,
     Oid4vciIssuerDisplayConfig, PolicyIdentifier, RateLimitBucket, RenderEvaluationRequest,
-    SelfAttestationConfig, SelfAttestationDenialCode, SelfAttestationScopePolicy, SourceCapability,
-    StandaloneRegistryNotaryConfig, StoredSelfAttestationMetadata, SubjectRequest,
-    VerifiedClaimValue, FORMAT_CLAIM_RESULT_JSON, FORMAT_SD_JWT_VC,
+    SelfAttestationConfig, SelfAttestationDenialCode, SelfAttestationScopePolicy, SigningKeyStatus,
+    SourceCapability, StandaloneRegistryNotaryConfig, StoredSelfAttestationMetadata,
+    SubjectRequest, VerifiedClaimValue, FORMAT_CLAIM_RESULT_JSON, FORMAT_SD_JWT_VC,
 };
 use registry_platform_audit::AuditKeyHasher;
 use registry_platform_config::{LocalTufRepositoryInput, TufConfigVerifier, VerificationContext};
@@ -315,8 +315,12 @@ async fn admin_config_verify(
             ),
         );
     }
-    let classification = if signed_bundle_allows_signing_key_rotation(&candidate) {
-        classify_credential_issuer_rotation(&state, &candidate_config)
+    let classification = if candidate.source == ConfigSource::SignedBundleFile {
+        classify_credential_issuer_rotation(
+            &state,
+            &candidate_config,
+            signing_change_authorization(&candidate),
+        )
     } else {
         Err(CredentialIssuerRotationError::RestartRequired)
     };
@@ -423,7 +427,11 @@ async fn admin_config_dry_run(
         );
     }
     let classification = if candidate.source == ConfigSource::SignedBundleFile {
-        classify_credential_issuer_rotation(&state, &candidate_config)
+        classify_credential_issuer_rotation(
+            &state,
+            &candidate_config,
+            signing_change_authorization(&candidate),
+        )
     } else {
         Err(CredentialIssuerRotationError::RestartRequired)
     };
@@ -587,7 +595,8 @@ async fn admin_config_apply(
             ),
         );
     }
-    if !signed_bundle_allows_signing_key_rotation(&candidate) {
+    let signing_change_authorization = signing_change_authorization(&candidate);
+    if !signing_change_authorization.any() {
         consume_apply_metadata(&request);
         return config_apply_report(
             candidate.bundle_id.clone(),
@@ -606,7 +615,11 @@ async fn admin_config_apply(
             ),
         );
     }
-    let issuer_rotation = match classify_credential_issuer_rotation(&state, &candidate_config) {
+    let issuer_rotation = match classify_credential_issuer_rotation(
+        &state,
+        &candidate_config,
+        signing_change_authorization,
+    ) {
         Ok(rotation) => rotation,
         Err(CredentialIssuerRotationError::RestartRequired) => {
             consume_apply_metadata(&request);
@@ -754,9 +767,24 @@ async fn admin_config_apply(
     )
 }
 
-fn signed_bundle_allows_signing_key_rotation(candidate: &ResolvedConfigCandidate) -> bool {
-    candidate.source == ConfigSource::SignedBundleFile
-        && candidate.change_classes.contains("signing_key_rotation")
+#[derive(Clone, Copy)]
+struct SigningChangeAuthorization {
+    rotation: bool,
+    cleanup: bool,
+}
+
+impl SigningChangeAuthorization {
+    fn any(self) -> bool {
+        self.rotation || self.cleanup
+    }
+}
+
+fn signing_change_authorization(candidate: &ResolvedConfigCandidate) -> SigningChangeAuthorization {
+    let signed = candidate.source == ConfigSource::SignedBundleFile;
+    SigningChangeAuthorization {
+        rotation: signed && candidate.change_classes.contains("signing_key_rotation"),
+        cleanup: signed && candidate.change_classes.contains("signing_key_cleanup"),
+    }
 }
 
 fn break_glass_proposal(
@@ -846,6 +874,7 @@ enum CredentialIssuerRotationError {
 fn classify_credential_issuer_rotation(
     state: &RegistryNotaryApiState,
     candidate: &StandaloneRegistryNotaryConfig,
+    authorization: SigningChangeAuthorization,
 ) -> Result<CredentialIssuerRotation, CredentialIssuerRotationError> {
     let Some(current) = state.runtime_config() else {
         return Err(CredentialIssuerRotationError::Readiness);
@@ -855,10 +884,18 @@ fn classify_credential_issuer_rotation(
     {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
-    if !notary_signing_key_reference_changed(&current, candidate) {
+    let reference_changed = notary_signing_key_reference_changed(&current, candidate);
+    let cleanup_key_ids = cleanup_signing_key_change_ids(&current, candidate)?;
+    if reference_changed && !authorization.rotation {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
-    if !changed_signing_keys_are_rotation_keys(&current, candidate) {
+    if !cleanup_key_ids.is_empty() && !authorization.cleanup {
+        return Err(CredentialIssuerRotationError::RestartRequired);
+    }
+    if !reference_changed && cleanup_key_ids.is_empty() {
+        return Err(CredentialIssuerRotationError::RestartRequired);
+    }
+    if !changed_signing_keys_are_allowed(&current, candidate, &cleanup_key_ids) {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
     old_referenced_keys_are_safe_for_rotation(&current, candidate)?;
@@ -980,9 +1017,10 @@ fn notary_signing_key_reference_changed(
         || current.federation.signing.signing_key != candidate.federation.signing.signing_key
 }
 
-fn changed_signing_keys_are_rotation_keys(
+fn changed_signing_keys_are_allowed(
     current: &StandaloneRegistryNotaryConfig,
     candidate: &StandaloneRegistryNotaryConfig,
+    cleanup_key_ids: &BTreeSet<String>,
 ) -> bool {
     let mut allowed = BTreeSet::new();
     for (profile_id, current_profile) in &current.evidence.credential_profiles {
@@ -1038,6 +1076,9 @@ fn changed_signing_keys_are_rotation_keys(
         allowed.insert(current.federation.signing.signing_key.as_str());
         allowed.insert(candidate.federation.signing.signing_key.as_str());
     }
+    for key_id in cleanup_key_ids {
+        allowed.insert(key_id.as_str());
+    }
     let mut keys = BTreeSet::new();
     keys.extend(current.evidence.signing_keys.keys().map(String::as_str));
     keys.extend(candidate.evidence.signing_keys.keys().map(String::as_str));
@@ -1045,6 +1086,93 @@ fn changed_signing_keys_are_rotation_keys(
         current.evidence.signing_keys.get(key) == candidate.evidence.signing_keys.get(key)
             || allowed.contains(key)
     })
+}
+
+fn cleanup_signing_key_change_ids(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
+) -> Result<BTreeSet<String>, CredentialIssuerRotationError> {
+    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+    let active_refs = active_notary_signing_key_refs(current, candidate);
+    let current_verification_refs = current
+        .auth
+        .access_token_signing
+        .verification_key_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let candidate_verification_refs = candidate
+        .auth
+        .access_token_signing
+        .verification_key_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut cleanup = BTreeSet::new();
+    for (key_id, current_key) in &current.evidence.signing_keys {
+        let candidate_key = candidate.evidence.signing_keys.get(key_id);
+        if candidate_key.is_some() {
+            continue;
+        }
+        if active_refs.contains(key_id) || candidate_verification_refs.contains(key_id) {
+            return Err(CredentialIssuerRotationError::RestartRequired);
+        }
+        if !matches!(current_key.status, SigningKeyStatus::PublishOnly) {
+            return Err(CredentialIssuerRotationError::RestartRequired);
+        }
+        if current_key.may_publish_at(now) {
+            return Err(CredentialIssuerRotationError::Readiness);
+        }
+        if current_verification_refs.contains(key_id)
+            && candidate_verification_refs.contains(key_id)
+        {
+            return Err(CredentialIssuerRotationError::RestartRequired);
+        }
+        cleanup.insert(key_id.clone());
+    }
+    Ok(cleanup)
+}
+
+fn active_notary_signing_key_refs(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
+) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    refs.extend(
+        current
+            .evidence
+            .credential_profiles
+            .values()
+            .map(|profile| profile.signing_key.clone()),
+    );
+    refs.extend(
+        candidate
+            .evidence
+            .credential_profiles
+            .values()
+            .map(|profile| profile.signing_key.clone()),
+    );
+    refs.insert(current.auth.access_token_signing.signing_key_id.clone());
+    refs.insert(candidate.auth.access_token_signing.signing_key_id.clone());
+    refs.insert(
+        current
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id
+            .clone(),
+    );
+    refs.insert(
+        candidate
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id
+            .clone(),
+    );
+    refs.insert(current.federation.signing.signing_key.clone());
+    refs.insert(candidate.federation.signing.signing_key.clone());
+    refs
 }
 
 fn old_referenced_keys_are_safe_for_rotation(
