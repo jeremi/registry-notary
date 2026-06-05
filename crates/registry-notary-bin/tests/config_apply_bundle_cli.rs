@@ -102,6 +102,37 @@ fn live_apply_bundle_command(server: &LiveNotaryServer, signed: &SignedConfigFix
     command
 }
 
+fn remote_live_apply_bundle_command(
+    server: &LiveNotaryServer,
+    signed: &SignedConfigFixture,
+    remote: &MockServer,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
+    command
+        .arg("config")
+        .arg("apply-bundle")
+        .arg("--admin-url")
+        .arg(&server.admin_url)
+        .arg("--admin-token-env")
+        .arg("NOTARY_ADMIN_TOKEN_TEST")
+        .arg("--root-path")
+        .arg(&signed.root_path)
+        .arg("--metadata-base-url")
+        .arg(format!("{}/metadata", remote.uri()))
+        .arg("--targets-base-url")
+        .arg(format!("{}/targets", remote.uri()))
+        .arg("--datastore-dir")
+        .arg(&signed.datastore_dir)
+        .arg("--target-name")
+        .arg(&signed.target_name)
+        .arg("--allow-dev-insecure-fetch-urls")
+        .arg("--local-approval-reference")
+        .arg("ROOT-2026-Q2")
+        .env("NOTARY_ADMIN_TOKEN_TEST", "admin-token")
+        .env_remove("REGISTRY_NOTARY_CONFIG");
+    command
+}
+
 fn remote_apply_bundle_command(server: &MockServer) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
     command
@@ -301,6 +332,41 @@ async fn write_signed_root_transition_fixture(
         targets_dir,
         datastore_dir,
         target_name: target_name.to_string(),
+    }
+}
+
+async fn serve_signed_tuf_fixture(signed: &SignedConfigFixture) -> MockServer {
+    let server = MockServer::start().await;
+    mount_directory_files(&server, "/metadata", &signed.metadata_dir).await;
+    mount_directory_files(&server, "/targets", &signed.targets_dir).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/2.root.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn mount_directory_files(server: &MockServer, url_prefix: &str, dir: &Path) {
+    for entry in std::fs::read_dir(dir).expect("directory reads") {
+        let entry = entry.expect("directory entry reads");
+        let path_on_disk = entry.path();
+        if !path_on_disk.is_file() {
+            continue;
+        }
+        let filename = path_on_disk
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture filename is UTF-8");
+        Mock::given(method("GET"))
+            .and(path(format!("{url_prefix}/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    std::fs::read(path_on_disk).expect("generated repo file reads"),
+                ),
+            )
+            .mount(server)
+            .await;
     }
 }
 
@@ -545,6 +611,105 @@ async fn config_apply_bundle_cli_drives_live_admin_root_transition_with_local_ap
     let audit_record = config_audit_record(&audit_path, "/admin/v1/config/apply");
     let config_audit = &audit_record["config"];
     assert_eq!(config_audit["source"], "signed_bundle_file");
+    assert_eq!(config_audit["bundle_id"], "notary-root-transition-bundle");
+    assert_eq!(config_audit["bundle_sequence"], 2);
+    assert_eq!(config_audit["change_classes"], json!(["root_transition"]));
+    assert_eq!(config_audit["local_approval_reference"], "ROOT-2026-Q2");
+    assert_eq!(
+        config_audit["local_approval_change_class"],
+        "root_transition"
+    );
+    assert_eq!(config_audit["apply_result"], "applied");
+    assert_eq!(config_audit["posture_result"], "accepted");
+    assert_eq!(config_audit["applied"], true);
+    assert_eq!(config_audit["restart_required"], false);
+}
+
+#[tokio::test]
+async fn config_apply_bundle_cli_drives_live_admin_remote_root_transition_with_local_approval() {
+    let tmp = TempDir::new().expect("tempdir");
+    let bind = allocate_loopback_addr();
+    let current_yaml = root_transition_config_yaml(&tmp, bind, false);
+    let current_config = write_current_config(&tmp, &current_yaml);
+    let antirollback_path = tmp.path().join("antirollback.json");
+    let local_approval_path = tmp.path().join("local-approvals.json");
+    let audit_path = tmp.path().join("audit.jsonl");
+    initialize_antirollback_state(&antirollback_path, &current_yaml);
+    let current_config_hash = internal_config_hash(current_yaml.as_bytes());
+
+    let candidate_yaml = root_transition_config_yaml(&tmp, bind, true);
+    write_local_approval_state(&local_approval_path, &candidate_yaml, &current_config_hash);
+    let signed =
+        write_signed_root_transition_fixture(&tmp, &current_config_hash, &candidate_yaml).await;
+    let remote = serve_signed_tuf_fixture(&signed).await;
+    let server = start_live_notary_server(&current_config, bind).await;
+
+    let output = remote_live_apply_bundle_command(&server, &signed, &remote)
+        .output()
+        .expect("live remote root transition apply-bundle command runs");
+
+    assert!(
+        output.status.success(),
+        "live remote root transition apply-bundle failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value =
+        serde_json::from_slice(&output.stdout).expect("apply-bundle emits server JSON");
+    assert_eq!(response["result"], "applied");
+    assert_eq!(response["bundle_id"], "notary-root-transition-bundle");
+    assert_eq!(response["applied"], true);
+    assert_eq!(response["restart_required"], false);
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("posture client builds");
+    let posture: Value = client
+        .get(format!(
+            "{}/admin/v1/posture?tier=restricted",
+            server.admin_url
+        ))
+        .bearer_auth("admin-token")
+        .send()
+        .await
+        .expect("posture request succeeds")
+        .error_for_status()
+        .expect("posture response succeeds")
+        .json()
+        .await
+        .expect("posture response is JSON");
+    assert_eq!(posture["configuration"]["source"], "signed_bundle_endpoint");
+    assert_eq!(
+        posture["configuration"]["last_bundle_id"],
+        "notary-root-transition-bundle"
+    );
+    assert_eq!(posture["configuration"]["last_bundle_sequence"], 2);
+    assert_eq!(posture["configuration"]["last_apply_result"], "accepted");
+    assert_eq!(posture["configuration"]["restart_required"], false);
+
+    let antirollback = FileAntiRollbackStore::new(&antirollback_path)
+        .load(&AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "notary-cli".to_string(),
+            environment: "development".to_string(),
+            stream_id: "notary-test-stream".to_string(),
+        })
+        .expect("anti-rollback state loads");
+    assert_eq!(antirollback.last_sequence, 2);
+    assert_eq!(
+        antirollback.last_config_hash,
+        internal_config_hash(candidate_yaml.as_bytes())
+    );
+    assert_eq!(antirollback.local_approvals.accepted.len(), 1);
+    assert_eq!(
+        antirollback.local_approvals.accepted[0].approval_reference,
+        "ROOT-2026-Q2"
+    );
+
+    let audit_record = config_audit_record(&audit_path, "/admin/v1/config/apply");
+    let config_audit = &audit_record["config"];
+    assert_eq!(config_audit["source"], "signed_bundle_endpoint");
     assert_eq!(config_audit["bundle_id"], "notary-root-transition-bundle");
     assert_eq!(config_audit["bundle_sequence"], 2);
     assert_eq!(config_audit["change_classes"], json!(["root_transition"]));
