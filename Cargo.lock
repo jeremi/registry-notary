@@ -2934,6 +2934,7 @@ dependencies = [
  "tracing",
  "ulid",
  "utoipa",
+ "wiremock",
  "zeroize",
 ]
 
@@ -2992,6 +2993,10 @@ dependencies = [
 name = "registry-platform-config"
 version = "0.1.2"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-core",
+ "registry-platform-httputil",
  "serde",
  "serde_json",
  "sha2 0.11.0",

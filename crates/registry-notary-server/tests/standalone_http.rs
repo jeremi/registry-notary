@@ -61,6 +61,8 @@ use tough::editor::signed::PathExists;
 use tough::editor::RepositoryEditor;
 use tough::key_source::LocalKeySource;
 use tough::schema::Target;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TEST_AUDIT_SECRET: &str = "0123456789abcdef0123456789abcdef";
 const TEST_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"#;
@@ -253,6 +255,54 @@ fn signed_tuf_apply_request(signed: &SignedConfigFixture) -> Value {
             "target_name": signed.target_name,
         }
     })
+}
+
+fn remote_signed_tuf_apply_request(signed: &SignedConfigFixture, server: &MockServer) -> Value {
+    json!({
+        "tuf": {
+            "root_path": signed.root_path,
+            "metadata_base_url": format!("{}/metadata", server.uri()),
+            "targets_base_url": format!("{}/targets", server.uri()),
+            "datastore_dir": signed.datastore_dir,
+            "target_name": signed.target_name,
+            "allow_dev_insecure_fetch_urls": true,
+        }
+    })
+}
+
+async fn serve_signed_tuf_fixture(signed: &SignedConfigFixture) -> MockServer {
+    let server = MockServer::start().await;
+    mount_directory_files(&server, "/metadata", &signed.metadata_dir).await;
+    mount_directory_files(&server, "/targets", &signed.targets_dir).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/2.root.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn mount_directory_files(server: &MockServer, url_prefix: &str, dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).expect("directory reads") {
+        let entry = entry.expect("directory entry reads");
+        let path_on_disk = entry.path();
+        if !path_on_disk.is_file() {
+            continue;
+        }
+        let filename = path_on_disk
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture filename is UTF-8");
+        Mock::given(method("GET"))
+            .and(path(format!("{url_prefix}/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    std::fs::read(path_on_disk).expect("generated repo file reads"),
+                ),
+            )
+            .mount(server)
+            .await;
+    }
 }
 
 fn signed_tuf_apply_request_with_local_approval(
@@ -3369,6 +3419,145 @@ async fn admin_config_apply_signed_credential_issuer_rotation_swaps_without_rest
 }
 
 #[tokio::test]
+async fn admin_config_apply_remote_signed_credential_issuer_rotation_swaps_without_restart() {
+    set_audit_secret();
+    std::env::set_var("TEST_EVIDENCE_SOURCE_TOKEN", "source-token");
+    std::env::set_var("TEST_SELF_ATTESTATION_ISSUER_JWK", TEST_ISSUER_JWK);
+    std::env::set_var(
+        "TEST_SELF_ATTESTATION_ISSUER_JWK_OLD_PUBLIC",
+        public_jwk_env_value(TEST_ISSUER_JWK, "did:web:issuer.example#key-1"),
+    );
+    std::env::set_var("TEST_SELF_ATTESTATION_ISSUER_JWK_2", TEST_HOLDER_JWK);
+
+    let idp = MockIdp::start().await;
+    let upstream = TestServer::builder()
+        .http_transport()
+        .build(Router::new().route(
+            "/v1/datasets/people/entities/person/records",
+            get(self_attestation_registry_data_api),
+        ));
+    let base_url = upstream
+        .server_address()
+        .expect("HTTP transport exposes upstream address")
+        .to_string();
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = self_attestation_oidc_config(
+        base_url.trim_end_matches('/'),
+        audit_path.to_str().expect("audit path is UTF-8"),
+        &idp.issuer(),
+        &idp.jwks_uri(),
+    );
+    config
+        .auth
+        .oidc
+        .as_mut()
+        .expect("OIDC config exists")
+        .scope_map
+        .insert(
+            "admin_ops".to_string(),
+            vec![
+                "registry_notary:admin".to_string(),
+                "registry_notary:ops_read".to_string(),
+            ],
+        );
+    enable_credential_status(&mut config);
+    config.self_attestation.allowed_operations.issue_credential = true;
+    config
+        .evidence
+        .claims
+        .first_mut()
+        .expect("person-is-alive claim exists")
+        .formats
+        .push("application/dc+sd-jwt".to_string());
+    add_config_trust(&mut config, antirollback_path.clone());
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+
+    let mut candidate = config.clone();
+    rotate_civil_status_issuer_signing_key(
+        &mut candidate,
+        "TEST_SELF_ATTESTATION_ISSUER_JWK_OLD_PUBLIC",
+        "TEST_SELF_ATTESTATION_ISSUER_JWK_2",
+        "issuer-key-2",
+        "did:web:issuer.example#key-2",
+    );
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["signing_key_rotation"],
+    )
+    .await;
+    let tuf_server = serve_signed_tuf_fixture(&signed).await;
+
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let admin_token = idp.mint_token(json!({
+        "sub": "config-admin",
+        "aud": "registry-notary-citizen",
+        "azp": "citizen-portal",
+        "scope": "admin_ops",
+        "iat": OffsetDateTime::now_utc().unix_timestamp(),
+        "exp": OffsetDateTime::now_utc().unix_timestamp() + 300,
+        "nbf": OffsetDateTime::now_utc().unix_timestamp(),
+    }));
+    let authorization = format!("Bearer {admin_token}");
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("authorization", authorization.clone())
+        .json(&remote_signed_tuf_apply_request(&signed, &tuf_server))
+        .await;
+
+    response.assert_status_ok();
+    let body: Value = response.json();
+    assert_eq!(body["result"], "applied");
+    assert_eq!(body["posture_result"], "accepted");
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["restart_required"], false);
+
+    let record = config_audit_record(&audit_path, "/admin/v1/config/apply");
+    let config_audit = &record["config"];
+    assert_eq!(config_audit["action"], "apply");
+    assert_eq!(config_audit["source"], "signed_bundle_endpoint");
+    assert_eq!(config_audit["bundle_id"], "notary-test-bundle");
+    assert_eq!(config_audit["bundle_sequence"], 2);
+    assert_eq!(config_audit["signer_kids"], json!([TUF_TARGETS_SIGNER_KID]));
+    assert_eq!(
+        config_audit["change_classes"],
+        json!(["signing_key_rotation"])
+    );
+    assert_eq!(config_audit["previous_config_hash"], current_config_hash);
+    assert_eq!(config_audit["apply_result"], "applied");
+    assert_eq!(config_audit["posture_result"], "accepted");
+    assert_eq!(config_audit["applied"], true);
+    assert_eq!(config_audit["restart_required"], false);
+
+    let posture = server
+        .get("/admin/v1/posture?tier=restricted")
+        .add_header("authorization", authorization)
+        .await;
+    posture.assert_status_ok();
+    let posture: Value = posture.json();
+    assert_eq!(posture["configuration"]["source"], "signed_bundle_endpoint");
+    assert_eq!(
+        posture["configuration"]["last_bundle_id"],
+        "notary-test-bundle"
+    );
+    assert_eq!(posture["configuration"]["last_bundle_sequence"], 2);
+    assert_eq!(posture["configuration"]["last_apply_result"], "accepted");
+    assert_eq!(posture["configuration"]["restart_required"], false);
+
+    idp.stop().await;
+}
+
+#[tokio::test]
 async fn admin_config_apply_signed_expired_publish_only_key_cleanup_swaps_without_restart() {
     set_audit_secret();
     std::env::set_var("TEST_EVIDENCE_SOURCE_TOKEN", "source-token");
@@ -4249,6 +4438,14 @@ async fn admin_config_apply_inline_credential_issuer_rotation_is_restart_require
     assert_eq!(body["posture_result"], "rejected");
     assert_eq!(body["applied"], false);
     assert_eq!(body["restart_required"], true);
+
+    let record = config_audit_record(&audit_path, "/admin/v1/config/apply");
+    assert_eq!(record["config"]["action"], "apply");
+    assert_eq!(record["config"]["source"], "local_file");
+    assert_eq!(
+        record["config"]["apply_result"],
+        "rejected_restart_required"
+    );
 
     idp.stop().await;
 }

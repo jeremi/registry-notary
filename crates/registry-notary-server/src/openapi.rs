@@ -73,7 +73,7 @@ fn build_openapi_document() -> OpenApi {
             "/admin/v1/config/verify": {
                 "post": {
                     "summary": "Validate a candidate runtime config",
-                    "description": "Standalone mode parses and validates an inline candidate config or verifies a local signed TUF config target. Inline candidates remain restart-required. Governed signed credential issuer key rotations may be hot-applied when anti-rollback state accepts the bundle.",
+                    "description": "Standalone mode parses and validates an inline candidate config or verifies a local or remote signed TUF config target. Inline candidates remain restart-required. Governed signed credential issuer key rotations may be hot-applied when anti-rollback state accepts the bundle.",
                     "operationId": "adminConfigVerify",
                     "requestBody": config_apply_request_body_schema(),
                     "responses": {
@@ -87,7 +87,7 @@ fn build_openapi_document() -> OpenApi {
             "/admin/v1/config/dry-run": {
                 "post": {
                     "summary": "Dry-run a candidate runtime config",
-                    "description": "Standalone mode validates an inline candidate config or verifies a local signed TUF config target. Inline candidates and non-swappable changes report rejected_restart_required without mutating runtime state.",
+                    "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Inline candidates and non-swappable changes report rejected_restart_required without mutating runtime state.",
                     "operationId": "adminConfigDryRun",
                     "requestBody": config_apply_request_body_schema(),
                     "responses": {
@@ -101,7 +101,7 @@ fn build_openapi_document() -> OpenApi {
             "/admin/v1/config/apply": {
                 "post": {
                     "summary": "Attempt to apply a candidate runtime config",
-                    "description": "Standalone mode validates an inline candidate config or verifies a local signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
+                    "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
                     "operationId": "adminConfigApply",
                     "requestBody": config_apply_request_body_schema(),
                     "responses": {
@@ -788,7 +788,9 @@ fn build_openapi_document() -> OpenApi {
                 "TokenRequest": token_request_schema(),
                 "TokenResponse": token_response_schema(),
                 "ConfigApplyRequest": config_apply_request_schema(),
+                "TufConfigTargetRequest": tuf_config_target_request_schema(),
                 "LocalTufConfigTargetRequest": local_tuf_config_target_request_schema(),
+                "RemoteTufConfigTargetRequest": remote_tuf_config_target_request_schema(),
                 "BreakGlassApproval": break_glass_approval_schema(),
                 "BreakGlassRateLimit": break_glass_rate_limit_schema(),
                 "Oid4vciError": oid4vci_error_schema()
@@ -2485,10 +2487,19 @@ fn config_apply_request_schema() -> Value {
                 "description": "Apply-only reference for a matching local approval record used by root_transition bundles."
             },
             "tuf": {
-                "$ref": "#/components/schemas/LocalTufConfigTargetRequest"
+                "$ref": "#/components/schemas/TufConfigTargetRequest"
             }
         },
         "additionalProperties": false
+    })
+}
+
+fn tuf_config_target_request_schema() -> Value {
+    json!({
+        "oneOf": [
+            { "$ref": "#/components/schemas/LocalTufConfigTargetRequest" },
+            { "$ref": "#/components/schemas/RemoteTufConfigTargetRequest" }
+        ]
     })
 }
 
@@ -2502,6 +2513,39 @@ fn local_tuf_config_target_request_schema() -> Value {
             "targets_dir": { "type": "string" },
             "datastore_dir": { "type": "string" },
             "target_name": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn remote_tuf_config_target_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "root_path",
+            "metadata_base_url",
+            "targets_base_url",
+            "datastore_dir",
+            "target_name"
+        ],
+        "properties": {
+            "root_path": { "type": "string" },
+            "metadata_base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS TUF metadata base URL. HTTP loopback is accepted only when allow_dev_insecure_fetch_urls is true."
+            },
+            "targets_base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "HTTPS TUF targets base URL. HTTP loopback is accepted only when allow_dev_insecure_fetch_urls is true."
+            },
+            "datastore_dir": { "type": "string" },
+            "target_name": { "type": "string" },
+            "allow_dev_insecure_fetch_urls": {
+                "type": "boolean",
+                "default": false
+            }
         },
         "additionalProperties": false
     })
@@ -3125,6 +3169,25 @@ mod tests {
             json!("#/components/schemas/BreakGlassRateLimit")
         );
         assert_eq!(request_schema["local_approval_reference"]["type"], "string");
+        assert_eq!(
+            request_schema["tuf"]["$ref"],
+            json!("#/components/schemas/TufConfigTargetRequest")
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["TufConfigTargetRequest"]["oneOf"],
+            json!([
+                { "$ref": "#/components/schemas/LocalTufConfigTargetRequest" },
+                { "$ref": "#/components/schemas/RemoteTufConfigTargetRequest" }
+            ])
+        );
+        let remote_tuf =
+            &doc["components"]["schemas"]["RemoteTufConfigTargetRequest"]["properties"];
+        assert_eq!(remote_tuf["metadata_base_url"]["format"], "uri");
+        assert_eq!(remote_tuf["targets_base_url"]["format"], "uri");
+        assert_eq!(
+            remote_tuf["allow_dev_insecure_fetch_urls"]["type"],
+            "boolean"
+        );
         assert_eq!(
             doc["components"]["schemas"]["BreakGlassApproval"]["properties"]
                 ["emergency_change_class"]["description"],

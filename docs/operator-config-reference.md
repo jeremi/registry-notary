@@ -118,10 +118,18 @@ local YAML loaded at startup. Governed config apply requires
 `antirollback_state_path` and `local_approval_state_path`, which must point to
 durable local state such as a mounted volume. `accepted_roots` uses the shared
 Registry trust-root shape.
-Standalone Registry Notary verifies local signed TUF config targets against
-`accepted_roots` when the admin request provides a `tuf` source. Verified TUF
-targets-role signature key IDs, not target-declared custom metadata, satisfy the
-role threshold. Inline YAML remains available for verify/dry-run diagnostics.
+Standalone Registry Notary verifies local or remote signed TUF config targets
+against `accepted_roots` when the admin request provides a `tuf` source.
+Verified TUF targets-role signature key IDs, not target-declared custom
+metadata, satisfy the role threshold. Inline YAML remains available for
+verify/dry-run diagnostics. Local TUF sources use `root_path`, `metadata_dir`,
+`targets_dir`, `datastore_dir`, and `target_name`. Remote TUF sources keep the
+same `root_path`, `datastore_dir`, and `target_name`, and replace local
+repository directories with `metadata_base_url` and `targets_base_url`. Remote
+sources are recorded as `signed_bundle_endpoint`; local repository sources are
+recorded as `signed_bundle_file`. HTTP loopback remote repositories require
+`allow_dev_insecure_fetch_urls: true` and are intended only for tests and local
+development.
 For TUF root transition, apply a signed local TUF bundle whose target metadata
 includes `root_transition`, changes only `config_trust.accepted_roots`, keeps
 the antirollback and local approval paths unchanged, retains existing roots

@@ -341,7 +341,7 @@
     "/admin/v1/config/apply": {
       "post": {
         "summary": "Attempt to apply a candidate runtime config",
-        "description": "Standalone mode validates an inline candidate config or verifies a local signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
+        "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
         "operationId": "adminConfigApply",
         "requestBody": {
           "content": {
@@ -441,7 +441,7 @@
     "/admin/v1/config/dry-run": {
       "post": {
         "summary": "Dry-run a candidate runtime config",
-        "description": "Standalone mode validates an inline candidate config or verifies a local signed TUF config target. Inline candidates and non-swappable changes report rejected_restart_required without mutating runtime state.",
+        "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Inline candidates and non-swappable changes report rejected_restart_required without mutating runtime state.",
         "operationId": "adminConfigDryRun",
         "requestBody": {
           "content": {
@@ -526,7 +526,7 @@
     "/admin/v1/config/verify": {
       "post": {
         "summary": "Validate a candidate runtime config",
-        "description": "Standalone mode parses and validates an inline candidate config or verifies a local signed TUF config target. Inline candidates remain restart-required. Governed signed credential issuer key rotations may be hot-applied when anti-rollback state accepts the bundle.",
+        "description": "Standalone mode parses and validates an inline candidate config or verifies a local or remote signed TUF config target. Inline candidates remain restart-required. Governed signed credential issuer key rotations may be hot-applied when anti-rollback state accepts the bundle.",
         "operationId": "adminConfigVerify",
         "requestBody": {
           "content": {
@@ -3007,6 +3007,10 @@
             "type": "string",
             "description": "Inline YAML candidate for verify and dry-run diagnostics."
           },
+          "local_approval_reference": {
+            "type": "string",
+            "description": "Apply-only reference for a matching local approval record used by root_transition bundles."
+          },
           "previous_config_hash": {
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$"
@@ -3026,7 +3030,7 @@
             "default": "default"
           },
           "tuf": {
-            "$ref": "#/components/schemas/LocalTufConfigTargetRequest"
+            "$ref": "#/components/schemas/TufConfigTargetRequest"
           }
         },
         "additionalProperties": false
@@ -3641,6 +3645,42 @@
         },
         "additionalProperties": true
       },
+      "RemoteTufConfigTargetRequest": {
+        "type": "object",
+        "required": [
+          "root_path",
+          "metadata_base_url",
+          "targets_base_url",
+          "datastore_dir",
+          "target_name"
+        ],
+        "properties": {
+          "allow_dev_insecure_fetch_urls": {
+            "type": "boolean",
+            "default": false
+          },
+          "datastore_dir": {
+            "type": "string"
+          },
+          "metadata_base_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS TUF metadata base URL. HTTP loopback is accepted only when allow_dev_insecure_fetch_urls is true."
+          },
+          "root_path": {
+            "type": "string"
+          },
+          "target_name": {
+            "type": "string"
+          },
+          "targets_base_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS TUF targets base URL. HTTP loopback is accepted only when allow_dev_insecure_fetch_urls is true."
+          }
+        },
+        "additionalProperties": false
+      },
       "RenderEvaluationRequest": {
         "type": "object",
         "required": [
@@ -3830,6 +3870,16 @@
             "example": "Bearer"
           }
         }
+      },
+      "TufConfigTargetRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LocalTufConfigTargetRequest"
+          },
+          {
+            "$ref": "#/components/schemas/RemoteTufConfigTargetRequest"
+          }
+        ]
       }
     },
     "securitySchemes": {

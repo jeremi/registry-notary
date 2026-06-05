@@ -39,7 +39,8 @@ use registry_notary_core::{
 };
 use registry_platform_audit::AuditKeyHasher;
 use registry_platform_config::{
-    LocalTufRepositoryInput, RegistryTrustRoot, TufConfigVerifier, VerificationContext,
+    LocalTufRepositoryInput, RegistryTrustRoot, RemoteTufRepositoryInput, TufConfigVerifier,
+    VerificationContext,
 };
 use registry_platform_crypto::KeyReadiness;
 use registry_platform_crypto::PublicJwk;
@@ -170,16 +171,36 @@ struct ConfigApplyRequest {
     #[serde(default)]
     local_approval_reference: Option<String>,
     #[serde(default)]
-    tuf: Option<LocalTufConfigTargetRequest>,
+    tuf: Option<TufConfigTargetRequest>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TufConfigTargetRequest {
+    Local(LocalTufConfigTargetRequest),
+    Remote(RemoteTufConfigTargetRequest),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LocalTufConfigTargetRequest {
     root_path: PathBuf,
     metadata_dir: PathBuf,
     targets_dir: PathBuf,
     datastore_dir: PathBuf,
     target_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTufConfigTargetRequest {
+    root_path: PathBuf,
+    metadata_base_url: String,
+    targets_base_url: String,
+    datastore_dir: PathBuf,
+    target_name: String,
+    #[serde(default)]
+    allow_dev_insecure_fetch_urls: bool,
 }
 
 struct ResolvedConfigCandidate {
@@ -320,7 +341,7 @@ async fn admin_config_verify(
             ),
         );
     }
-    let classification = if candidate.source == ConfigSource::SignedBundleFile {
+    let classification = if is_signed_config_source(candidate.source) {
         classify_credential_issuer_rotation(
             &state,
             &candidate_config,
@@ -431,7 +452,7 @@ async fn admin_config_dry_run(
             ),
         );
     }
-    let classification = if candidate.source == ConfigSource::SignedBundleFile {
+    let classification = if is_signed_config_source(candidate.source) {
         classify_credential_issuer_rotation(
             &state,
             &candidate_config,
@@ -562,7 +583,7 @@ async fn admin_config_apply(
             .with_break_glass_request(&request),
         );
     }
-    if candidate.source != ConfigSource::SignedBundleFile {
+    if !is_signed_config_source(candidate.source) {
         consume_apply_metadata(&request);
         if request.break_glass {
             return config_apply_report(
@@ -856,7 +877,7 @@ impl SigningChangeAuthorization {
 }
 
 fn signing_change_authorization(candidate: &ResolvedConfigCandidate) -> SigningChangeAuthorization {
-    let signed = candidate.source == ConfigSource::SignedBundleFile;
+    let signed = is_signed_config_source(candidate.source);
     SigningChangeAuthorization {
         rotation: signed && candidate.change_classes.contains("signing_key_rotation"),
         cleanup: signed && candidate.change_classes.contains("signing_key_cleanup"),
@@ -981,8 +1002,15 @@ enum RootTransitionError {
 }
 
 fn root_transition_authorized(candidate: &ResolvedConfigCandidate) -> bool {
-    candidate.source == ConfigSource::SignedBundleFile
+    is_signed_config_source(candidate.source)
         && candidate.change_classes.contains("root_transition")
+}
+
+fn is_signed_config_source(source: ConfigSource) -> bool {
+    matches!(
+        source,
+        ConfigSource::SignedBundleFile | ConfigSource::SignedBundleEndpoint
+    )
 }
 
 fn classify_root_transition(
@@ -1482,7 +1510,7 @@ async fn resolve_config_candidate(
                 change_classes: BTreeSet::new(),
                 signer_kids: BTreeSet::new(),
                 config_yaml: config_yaml.clone(),
-                source: ConfigSource::Unknown,
+                source: ConfigSource::LocalFile,
             })
         }
         (None, Some(tuf)) => resolve_tuf_config_candidate(tuf, state).await,
@@ -1493,7 +1521,7 @@ async fn resolve_config_candidate(
 }
 
 async fn resolve_tuf_config_candidate(
-    request: &LocalTufConfigTargetRequest,
+    request: &TufConfigTargetRequest,
     state: &RegistryNotaryApiState,
 ) -> Result<ResolvedConfigCandidate, ConfigCandidateError> {
     let config_governance = state.config_governance();
@@ -1512,18 +1540,43 @@ async fn resolve_tuf_config_candidate(
         instance_id: config_governance.instance_id.clone(),
         environment: config_governance.environment.clone(),
     };
-    let input = LocalTufRepositoryInput {
-        root_path: request.root_path.clone(),
-        metadata_dir: request.metadata_dir.clone(),
-        targets_dir: request.targets_dir.clone(),
-        datastore_dir: request.datastore_dir.clone(),
-        target_name: request.target_name.clone(),
+    let (verified, source) = match request {
+        TufConfigTargetRequest::Local(request) => {
+            let input = LocalTufRepositoryInput {
+                root_path: request.root_path.clone(),
+                metadata_dir: request.metadata_dir.clone(),
+                targets_dir: request.targets_dir.clone(),
+                datastore_dir: request.datastore_dir.clone(),
+                target_name: request.target_name.clone(),
+            };
+            let verified = TufConfigVerifier::verify_config_target(&input, &context)
+                .await
+                .map_err(|_| {
+                    ConfigCandidateError::BundleInvalid(
+                        "signed config target could not be verified",
+                    )
+                })?;
+            (verified, ConfigSource::SignedBundleFile)
+        }
+        TufConfigTargetRequest::Remote(request) => {
+            let input = RemoteTufRepositoryInput {
+                root_path: request.root_path.clone(),
+                metadata_base_url: request.metadata_base_url.clone(),
+                targets_base_url: request.targets_base_url.clone(),
+                datastore_dir: request.datastore_dir.clone(),
+                target_name: request.target_name.clone(),
+                allow_dev_insecure_fetch_urls: request.allow_dev_insecure_fetch_urls,
+            };
+            let verified = TufConfigVerifier::verify_remote_config_target(&input, &context)
+                .await
+                .map_err(|_| {
+                    ConfigCandidateError::BundleInvalid(
+                        "signed config target could not be verified",
+                    )
+                })?;
+            (verified, ConfigSource::SignedBundleEndpoint)
+        }
     };
-    let verified = TufConfigVerifier::verify_config_target(&input, &context)
-        .await
-        .map_err(|_| {
-            ConfigCandidateError::BundleInvalid("signed config target could not be verified")
-        })?;
     if !config_trust.accepted_roots.iter().any(|root| {
         root.authorize(
             &verified.metadata.change_classes,
@@ -1548,7 +1601,7 @@ async fn resolve_tuf_config_candidate(
         change_classes: verified.metadata.change_classes,
         signer_kids: verified.tuf.signer_kids.into_iter().collect(),
         config_yaml,
-        source: ConfigSource::SignedBundleFile,
+        source,
     })
 }
 
@@ -1744,8 +1797,11 @@ impl ConfigAuditLocalApprovalExt for ConfigAuditEvent {
 }
 
 fn request_config_source(request: &ConfigApplyRequest) -> ConfigSource {
-    if request.tuf.is_some() {
-        ConfigSource::SignedBundleFile
+    if let Some(tuf) = &request.tuf {
+        match tuf {
+            TufConfigTargetRequest::Local(_) => ConfigSource::SignedBundleFile,
+            TufConfigTargetRequest::Remote(_) => ConfigSource::SignedBundleEndpoint,
+        }
     } else if request.config_yaml.is_some() {
         ConfigSource::LocalFile
     } else {
@@ -7310,6 +7366,26 @@ mod tests {
     const ISSUER_PRIV_D_B64: &str = "f4QIxnAyRWzhuBOmNRgvBTE56mWePdsPL0mvCtl8Gys";
     const ISSUER_PUB_X_B64: &str = "pv4e_hXHBLN27rcs6VDFV1ED0TiU8M3xy9vsuWFEsec";
     const SUBJECT_BINDING_CLAIM: &str = "https://id.example.gov/claims/national_id";
+
+    #[test]
+    fn config_request_rejects_ambiguous_local_and_remote_tuf_source() {
+        let request = serde_json::from_value::<ConfigApplyRequest>(json!({
+            "tuf": {
+                "root_path": "/etc/registry-notary/trust/root.json",
+                "metadata_dir": "/etc/registry-notary/trust/metadata",
+                "targets_dir": "/etc/registry-notary/trust/targets",
+                "metadata_base_url": "https://config.example.gov/metadata/",
+                "targets_base_url": "https://config.example.gov/targets/",
+                "datastore_dir": "/var/lib/registry-notary/config-tuf",
+                "target_name": "registry-notary.yaml"
+            }
+        }));
+
+        assert!(
+            request.is_err(),
+            "TUF request must choose exactly one local or remote source shape"
+        );
+    }
 
     fn holder_did_jwk() -> String {
         let holder = PrivateJwk::parse(
