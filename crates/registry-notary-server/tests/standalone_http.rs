@@ -7717,7 +7717,6 @@ fn jwt_payload(jwt: &str) -> Value {
 }
 
 /// Decode (without verifying) the JOSE header of a compact JWT.
-#[cfg(feature = "registry-notary-cel")]
 fn jwt_header(jwt: &str) -> Value {
     let header_b64 = jwt.split('.').next().expect("jwt has a header segment");
     let bytes = URL_SAFE_NO_PAD
@@ -7727,7 +7726,6 @@ fn jwt_header(jwt: &str) -> Value {
 }
 
 /// Extract a field from an `application/x-www-form-urlencoded` body.
-#[cfg(feature = "registry-notary-cel")]
 fn form_field(body: &str, name: &str) -> Option<String> {
     for pair in body.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -7736,6 +7734,26 @@ fn form_field(body: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+async fn latest_esignet_client_assertion_kid(token_upstream: &MockHttpUpstream) -> String {
+    let requests = token_upstream
+        .wiremock_server()
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    let token_request = requests
+        .iter()
+        .rev()
+        .find(|request| request.url.path() == "/token")
+        .expect("the Notary posts to the eSignet token endpoint");
+    let body = String::from_utf8(token_request.body.clone()).expect("token request body is UTF-8");
+    let client_assertion = form_field(&body, "client_assertion")
+        .expect("the token request carries a client_assertion");
+    jwt_header(&client_assertion)["kid"]
+        .as_str()
+        .expect("client assertion header carries kid")
+        .to_string()
 }
 
 #[tokio::test]
@@ -8099,6 +8117,190 @@ async fn preauth_token_endpoint_issues_access_token_and_c_nonce() {
     assert_eq!(body["token_type"], json!("Bearer"));
     assert!(body["c_nonce"].is_string());
     assert_eq!(body["expires_in"], json!(300));
+    idp.stop().await;
+}
+
+#[tokio::test]
+async fn admin_config_apply_signed_preauth_signing_rotation_preserves_inflight_tokens() {
+    set_preauth_env();
+    let idp = MockIdp::start().await;
+    let token_upstream = MockHttpUpstream::start().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = preauth_test_config(
+        "http://127.0.0.1:1",
+        audit_path.to_str().expect("audit path is UTF-8"),
+        &idp,
+        &token_upstream,
+    );
+    config
+        .auth
+        .oidc
+        .as_mut()
+        .expect("OIDC config exists")
+        .scope_map
+        .insert(
+            "admin_ops".to_string(),
+            vec![
+                "registry_notary:admin".to_string(),
+                "registry_notary:ops_read".to_string(),
+            ],
+        );
+    add_config_trust(&mut config, antirollback_path.clone());
+
+    let app = standalone_router(config.clone()).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+
+    let old_unredeemed = drive_offer_to_page(&server, &token_upstream, &idp, "person-1").await;
+    assert_eq!(
+        jwt_header(&old_unredeemed.code)["kid"],
+        "did:web:issuer.example#access-token-key"
+    );
+    assert_eq!(
+        latest_esignet_client_assertion_kid(&token_upstream).await,
+        "did:web:rp.example#esignet-rp-key"
+    );
+    let old_access_token = mint_notary_access_token(
+        TEST_ACCESS_TOKEN_JWK,
+        "did:web:issuer.example#access-token-key",
+        "registry-notary-access+jwt",
+        NOTARY_ISSUER,
+        "person-1",
+    );
+    assert_eq!(
+        jwt_header(&old_access_token)["kid"],
+        "did:web:issuer.example#access-token-key"
+    );
+
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+
+    std::env::set_var("TEST_ACCESS_TOKEN_JWK_2", TEST_HOLDER_JWK);
+    std::env::set_var("TEST_ESIGNET_RP_JWK_2", TEST_ISSUER_JWK);
+    std::env::set_var(
+        "TEST_ACCESS_TOKEN_JWK_OLD_PUBLIC",
+        public_jwk_env_value(
+            TEST_ACCESS_TOKEN_JWK,
+            "did:web:issuer.example#access-token-key",
+        ),
+    );
+    std::env::set_var(
+        "TEST_ESIGNET_RP_JWK_OLD_PUBLIC",
+        public_jwk_env_value(TEST_ESIGNET_RP_JWK, "did:web:rp.example#esignet-rp-key"),
+    );
+    let mut candidate = config.clone();
+    let publish_until_unix_seconds =
+        u64::try_from((OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp())
+            .unwrap();
+    let old_access_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("access-token-key")
+        .expect("old access-token key exists");
+    old_access_key.status = SigningKeyStatus::PublishOnly;
+    old_access_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_access_key.private_jwk_env.clear();
+    old_access_key.public_jwk_env = "TEST_ACCESS_TOKEN_JWK_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "access-token-key-2".to_string(),
+        local_jwk_signing_key(
+            "TEST_ACCESS_TOKEN_JWK_2",
+            "did:web:issuer.example#access-token-key-2",
+        ),
+    );
+    candidate.auth.access_token_signing.signing_key_id = "access-token-key-2".to_string();
+    candidate.auth.access_token_signing.verification_key_ids = vec!["access-token-key".to_string()];
+
+    let old_esignet_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("esignet-rp-key")
+        .expect("old eSignet RP key exists");
+    old_esignet_key.status = SigningKeyStatus::PublishOnly;
+    old_esignet_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_esignet_key.private_jwk_env.clear();
+    old_esignet_key.public_jwk_env = "TEST_ESIGNET_RP_JWK_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "esignet-rp-key-2".to_string(),
+        local_jwk_signing_key(
+            "TEST_ESIGNET_RP_JWK_2",
+            "did:web:rp.example#esignet-rp-key-2",
+        ),
+    );
+    candidate
+        .oid4vci
+        .pre_authorized_code
+        .esignet
+        .client_signing_key_id = "esignet-rp-key-2".to_string();
+
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["signing_key_rotation"],
+    )
+    .await;
+
+    let admin_token = idp.mint_token(json!({
+        "sub": "config-admin",
+        "aud": "registry-notary-citizen",
+        "azp": "citizen-portal",
+        "scope": "admin_ops",
+        "iat": OffsetDateTime::now_utc().unix_timestamp(),
+        "exp": OffsetDateTime::now_utc().unix_timestamp() + 300,
+        "nbf": OffsetDateTime::now_utc().unix_timestamp(),
+    }));
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("authorization", format!("Bearer {admin_token}"))
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+    response.assert_status_ok();
+    let body: Value = response.json();
+    assert_eq!(body["result"], "applied");
+    assert_eq!(body["restart_required"], false);
+
+    let old_access_auth = server
+        .get("/.well-known/evidence/jwks.json")
+        .add_header("authorization", format!("Bearer {old_access_token}"))
+        .await;
+    old_access_auth.assert_status_ok();
+
+    let old_code_after_apply = redeem_token(
+        &server,
+        &old_unredeemed.code,
+        old_unredeemed
+            .pin
+            .as_deref()
+            .expect("old offer page shows PIN"),
+    )
+    .await;
+    old_code_after_apply.assert_status_ok();
+    let old_code_after_apply_body: Value = old_code_after_apply.json();
+    let access_token_after_apply = old_code_after_apply_body["access_token"]
+        .as_str()
+        .expect("access token issued from old code after apply");
+    assert_eq!(
+        jwt_header(access_token_after_apply)["kid"],
+        "did:web:issuer.example#access-token-key-2"
+    );
+
+    token_upstream.wiremock_server().reset().await;
+    let new_page = drive_offer_to_page(&server, &token_upstream, &idp, "person-1").await;
+    assert_eq!(
+        jwt_header(&new_page.code)["kid"],
+        "did:web:issuer.example#access-token-key-2"
+    );
+    assert_eq!(
+        latest_esignet_client_assertion_kid(&token_upstream).await,
+        "did:web:rp.example#esignet-rp-key-2"
+    );
     idp.stop().await;
 }
 

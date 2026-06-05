@@ -555,6 +555,49 @@ impl StandaloneRegistryNotaryConfig {
                 ));
             }
         }
+        let mut verification_keys = std::collections::BTreeSet::new();
+        for key_id in &signing.verification_key_ids {
+            if key_id.trim().is_empty() {
+                return invalid_access_token_signing(
+                    "verification_key_ids must not contain blank entries",
+                );
+            }
+            if key_id == &signing.signing_key_id {
+                return invalid_access_token_signing(format!(
+                    "verification_key_ids must not repeat active signing_key_id '{}'",
+                    signing.signing_key_id
+                ));
+            }
+            if !verification_keys.insert(key_id.as_str()) {
+                return invalid_access_token_signing(format!(
+                    "verification_key_ids contains duplicate key '{key_id}'"
+                ));
+            }
+            let key = self.evidence.signing_keys.get(key_id).ok_or_else(|| {
+                EvidenceConfigError::InvalidAccessTokenSigningConfig {
+                    reason: format!(
+                        "verification_key_ids entry '{key_id}' must reference an evidence.signing_keys entry"
+                    ),
+                }
+            })?;
+            if !key.status.may_publish() || key.status.may_sign() {
+                return invalid_access_token_signing(format!(
+                    "verification_key_ids entry '{key_id}' must be a publish_only signing key"
+                ));
+            }
+            if key.alg != CREDENTIAL_SIGNING_ALG_EDDSA {
+                return invalid_access_token_signing(format!(
+                    "verification_key_ids entry '{key_id}' must use {CREDENTIAL_SIGNING_ALG_EDDSA}"
+                ));
+            }
+            for (profile_id, profile) in &self.evidence.credential_profiles {
+                if profile.signing_key == *key_id {
+                    return invalid_access_token_signing(format!(
+                        "verification_key_ids entry '{key_id}' must be distinct from credential profile '{profile_id}' signing key"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3157,6 +3200,11 @@ pub struct AccessTokenSigningConfig {
     /// dedicated key, never a credential-signing key.
     #[serde(default)]
     pub signing_key_id: String,
+    /// Additional publish-only `evidence.signing_keys` entries accepted for
+    /// verifying previously minted Notary access tokens and pre-authorized
+    /// codes during a governed key rotation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_key_ids: Vec<String>,
     /// Access-token lifetime in seconds.
     #[serde(default = "default_access_token_ttl_seconds")]
     pub access_token_ttl_seconds: u64,
@@ -3171,6 +3219,7 @@ impl Default for AccessTokenSigningConfig {
             allowed_algorithms: default_access_token_signing_algorithms(),
             token_typ: default_access_token_typ(),
             signing_key_id: String::new(),
+            verification_key_ids: Vec::new(),
             access_token_ttl_seconds: default_access_token_ttl_seconds(),
         }
     }
@@ -8057,6 +8106,15 @@ status: active
         .expect("access-token signing key is valid YAML")
     }
 
+    fn publish_only_access_token_verification_key(kid: &str) -> SigningKeyConfig {
+        let mut key = second_signing_key();
+        key.kid = kid.to_string();
+        key.status = SigningKeyStatus::PublishOnly;
+        key.private_jwk_env = String::new();
+        key.public_jwk_env = "ACCESS_TOKEN_PUBLIC_KEY".to_string();
+        key
+    }
+
     /// A pre-auth-enabled oid4vci config with a dedicated access-token signing
     /// key, distinct from the credential-signing key.
     fn valid_pre_auth_config() -> StandaloneRegistryNotaryConfig {
@@ -8205,6 +8263,67 @@ access_token_ttl_seconds: 300
         config.auth.access_token_signing.allowed_algorithms = vec!["RS256".to_string()];
         let reason = expect_access_token_signing_error(&config);
         assert!(reason.contains("EdDSA"));
+    }
+
+    #[test]
+    fn access_token_verification_key_ids_accept_publish_only_old_keys() {
+        let mut config = valid_pre_auth_config();
+        config.evidence.signing_keys.insert(
+            "access-token-key-old".to_string(),
+            publish_only_access_token_verification_key(
+                "did:web:issuer.example#access-token-key-old",
+            ),
+        );
+        config.auth.access_token_signing.verification_key_ids =
+            vec!["access-token-key-old".to_string()];
+
+        config
+            .validate()
+            .expect("publish-only verification keys are valid during rotation");
+    }
+
+    #[test]
+    fn access_token_verification_key_ids_must_not_repeat_active_key() {
+        let mut config = valid_pre_auth_config();
+        config.auth.access_token_signing.verification_key_ids =
+            vec!["access-token-key".to_string()];
+
+        let reason = expect_access_token_signing_error(&config);
+        assert!(reason.contains("must not repeat active signing_key_id"));
+    }
+
+    #[test]
+    fn access_token_verification_key_ids_must_be_unique() {
+        let mut config = valid_pre_auth_config();
+        config.evidence.signing_keys.insert(
+            "access-token-key-old".to_string(),
+            publish_only_access_token_verification_key(
+                "did:web:issuer.example#access-token-key-old",
+            ),
+        );
+        config.auth.access_token_signing.verification_key_ids = vec![
+            "access-token-key-old".to_string(),
+            "access-token-key-old".to_string(),
+        ];
+
+        let reason = expect_access_token_signing_error(&config);
+        assert!(reason.contains("duplicate key"));
+    }
+
+    #[test]
+    fn access_token_verification_key_ids_must_be_publish_only() {
+        let mut config = valid_pre_auth_config();
+        let mut active_old_key = second_signing_key();
+        active_old_key.kid = "did:web:issuer.example#access-token-key-old".to_string();
+        config
+            .evidence
+            .signing_keys
+            .insert("access-token-key-old".to_string(), active_old_key);
+        config.auth.access_token_signing.verification_key_ids =
+            vec!["access-token-key-old".to_string()];
+
+        let reason = expect_access_token_signing_error(&config);
+        assert!(reason.contains("publish_only"));
     }
 
     /// An RS256 signing key entry. Config validation only checks the alg string

@@ -77,7 +77,7 @@ use crate::{
     runtime::claim_ids,
     standalone::{
         constant_time_eq, generate_numeric_tx_code, generate_opaque_token, pkce_s256_challenge,
-        pre_auth_audit_event, PreAuthAuditFields, PreAuthRuntime, SignerReadiness,
+        pre_auth_audit_event, AuthAuditState, PreAuthAuditFields, PreAuthRuntime, SignerReadiness,
     },
     BatchEvaluateOptions, EvidenceStore, RegistryNotaryRuntime, SelfAttestationRateLimitBucket,
     SelfAttestationRateLimitError, SelfAttestationRateLimitKeys, SelfAttestationRateLimiter,
@@ -628,6 +628,28 @@ async fn admin_config_apply(
             );
         }
     };
+    let candidate_config = Arc::new(candidate_config);
+    let notary_auth_anchor = match state.notary_auth_anchor_for_config(&candidate_config) {
+        Ok(anchor) => anchor,
+        Err(_) => {
+            return config_apply_report(
+                candidate.bundle_id.clone(),
+                candidate.sequence,
+                ApplyReportResult::RejectedReadiness,
+                false,
+                false,
+                StatusCode::CONFLICT,
+                resolved_config_audit(
+                    ConfigAdminAction::Apply,
+                    &candidate,
+                    "rejected",
+                    ApplyReportResult::RejectedReadiness.as_str(),
+                    false,
+                    false,
+                ),
+            );
+        }
+    };
     let Some(config_trust) = &state.config_governance.config_trust else {
         return with_config_audit(
             config_apply_unavailable("config_trust.antirollback_state_path is not configured"),
@@ -677,12 +699,13 @@ async fn admin_config_apply(
         );
     }
     consume_apply_metadata(&request);
-    let candidate_config = Arc::new(candidate_config);
+    state.swap_notary_auth_anchor(notary_auth_anchor);
     state.swap_issuer_runtime(
         candidate_config.clone(),
         issuer_rotation.issuers,
         issuer_rotation.signer_readiness,
     );
+    state.swap_preauth_runtime(issuer_rotation.preauth);
     state.record_config_apply(ConfigApplyPosture {
         source: candidate.source,
         last_config_hash: Some(posture_hash(&candidate_config)),
@@ -786,6 +809,7 @@ fn parse_candidate_config(
 struct CredentialIssuerRotation {
     issuers: Arc<dyn EvidenceIssuerResolver>,
     signer_readiness: SignerReadiness,
+    preauth: Option<Arc<PreAuthRuntime>>,
 }
 
 enum CredentialIssuerRotationError {
@@ -800,28 +824,35 @@ fn classify_credential_issuer_rotation(
     let Some(current) = state.runtime_config() else {
         return Err(CredentialIssuerRotationError::Readiness);
     };
-    if !equivalent_except_credential_issuer_rotation(&current, candidate)
+    if !equivalent_except_notary_signing_rotation(&current, candidate)
         .map_err(|_| CredentialIssuerRotationError::Readiness)?
     {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
-    if !credential_profile_signing_key_changed(&current.evidence, &candidate.evidence) {
+    if !notary_signing_key_reference_changed(&current, candidate) {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
-    if !changed_signing_keys_are_profile_rotation_keys(&current.evidence, &candidate.evidence) {
+    if !changed_signing_keys_are_rotation_keys(&current, candidate) {
         return Err(CredentialIssuerRotationError::RestartRequired);
     }
-    old_profile_keys_are_safe_for_rotation(&current.evidence, &candidate.evidence)?;
+    old_referenced_keys_are_safe_for_rotation(&current, candidate)?;
     let (issuers, signer_readiness) =
         crate::standalone::credential_issuer_runtime_from_config(&candidate.evidence)
             .map_err(|_| CredentialIssuerRotationError::Readiness)?;
+    let previous_preauth = preauth_runtime(state);
+    let preauth = crate::standalone::preauth_runtime_from_config_preserving_stores(
+        candidate,
+        previous_preauth.as_deref(),
+    )
+    .map_err(|_| CredentialIssuerRotationError::Readiness)?;
     Ok(CredentialIssuerRotation {
         issuers,
         signer_readiness,
+        preauth,
     })
 }
 
-fn equivalent_except_credential_issuer_rotation(
+fn equivalent_except_notary_signing_rotation(
     current: &StandaloneRegistryNotaryConfig,
     candidate: &StandaloneRegistryNotaryConfig,
 ) -> Result<bool, &'static str> {
@@ -829,12 +860,12 @@ fn equivalent_except_credential_issuer_rotation(
         serde_json::to_value(current).map_err(|_| "current config could not be normalized")?;
     let mut candidate =
         serde_json::to_value(candidate).map_err(|_| "candidate config could not be normalized")?;
-    normalize_credential_issuer_rotation_fields(&mut current);
-    normalize_credential_issuer_rotation_fields(&mut candidate);
+    normalize_notary_signing_rotation_fields(&mut current);
+    normalize_notary_signing_rotation_fields(&mut candidate);
     Ok(current == candidate)
 }
 
-fn normalize_credential_issuer_rotation_fields(value: &mut Value) {
+fn normalize_notary_signing_rotation_fields(value: &mut Value) {
     let Some(evidence) = value.get_mut("evidence").and_then(Value::as_object_mut) else {
         return;
     };
@@ -849,32 +880,67 @@ fn normalize_credential_issuer_rotation_fields(value: &mut Value) {
             }
         }
     }
+    if let Some(auth) = value
+        .get_mut("auth")
+        .and_then(Value::as_object_mut)
+        .and_then(|auth| auth.get_mut("access_token_signing"))
+        .and_then(Value::as_object_mut)
+    {
+        auth.remove("signing_key_id");
+        auth.remove("verification_key_ids");
+    }
+    if let Some(esignet) = value
+        .get_mut("oid4vci")
+        .and_then(Value::as_object_mut)
+        .and_then(|oid4vci| oid4vci.get_mut("pre_authorized_code"))
+        .and_then(Value::as_object_mut)
+        .and_then(|preauth| preauth.get_mut("esignet"))
+        .and_then(Value::as_object_mut)
+    {
+        esignet.remove("client_signing_key_id");
+    }
 }
 
-fn credential_profile_signing_key_changed(
-    current: &EvidenceConfig,
-    candidate: &EvidenceConfig,
+fn notary_signing_key_reference_changed(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
 ) -> bool {
     current
+        .evidence
         .credential_profiles
         .iter()
         .any(|(profile_id, current_profile)| {
             candidate
+                .evidence
                 .credential_profiles
                 .get(profile_id)
                 .is_some_and(|candidate_profile| {
                     candidate_profile.signing_key != current_profile.signing_key
                 })
         })
+        || current.auth.access_token_signing.signing_key_id
+            != candidate.auth.access_token_signing.signing_key_id
+        || current.auth.access_token_signing.verification_key_ids
+            != candidate.auth.access_token_signing.verification_key_ids
+        || current
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id
+            != candidate
+                .oid4vci
+                .pre_authorized_code
+                .esignet
+                .client_signing_key_id
 }
 
-fn changed_signing_keys_are_profile_rotation_keys(
-    current: &EvidenceConfig,
-    candidate: &EvidenceConfig,
+fn changed_signing_keys_are_rotation_keys(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
 ) -> bool {
     let mut allowed = BTreeSet::new();
-    for (profile_id, current_profile) in &current.credential_profiles {
-        let Some(candidate_profile) = candidate.credential_profiles.get(profile_id) else {
+    for (profile_id, current_profile) in &current.evidence.credential_profiles {
+        let Some(candidate_profile) = candidate.evidence.credential_profiles.get(profile_id) else {
             return false;
         };
         if candidate_profile.signing_key != current_profile.signing_key {
@@ -882,48 +948,119 @@ fn changed_signing_keys_are_profile_rotation_keys(
             allowed.insert(candidate_profile.signing_key.as_str());
         }
     }
+    if current.auth.access_token_signing.signing_key_id
+        != candidate.auth.access_token_signing.signing_key_id
+    {
+        allowed.insert(current.auth.access_token_signing.signing_key_id.as_str());
+        allowed.insert(candidate.auth.access_token_signing.signing_key_id.as_str());
+    }
+    for key_id in &current.auth.access_token_signing.verification_key_ids {
+        allowed.insert(key_id.as_str());
+    }
+    for key_id in &candidate.auth.access_token_signing.verification_key_ids {
+        allowed.insert(key_id.as_str());
+    }
+    if current
+        .oid4vci
+        .pre_authorized_code
+        .esignet
+        .client_signing_key_id
+        != candidate
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id
+    {
+        allowed.insert(
+            current
+                .oid4vci
+                .pre_authorized_code
+                .esignet
+                .client_signing_key_id
+                .as_str(),
+        );
+        allowed.insert(
+            candidate
+                .oid4vci
+                .pre_authorized_code
+                .esignet
+                .client_signing_key_id
+                .as_str(),
+        );
+    }
     let mut keys = BTreeSet::new();
-    keys.extend(current.signing_keys.keys().map(String::as_str));
-    keys.extend(candidate.signing_keys.keys().map(String::as_str));
+    keys.extend(current.evidence.signing_keys.keys().map(String::as_str));
+    keys.extend(candidate.evidence.signing_keys.keys().map(String::as_str));
     keys.into_iter().all(|key| {
-        current.signing_keys.get(key) == candidate.signing_keys.get(key) || allowed.contains(key)
+        current.evidence.signing_keys.get(key) == candidate.evidence.signing_keys.get(key)
+            || allowed.contains(key)
     })
 }
 
-fn old_profile_keys_are_safe_for_rotation(
-    current: &EvidenceConfig,
-    candidate: &EvidenceConfig,
+fn old_referenced_keys_are_safe_for_rotation(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
 ) -> Result<(), CredentialIssuerRotationError> {
-    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
-    for (profile_id, current_profile) in &current.credential_profiles {
-        let Some(candidate_profile) = candidate.credential_profiles.get(profile_id) else {
+    let mut old_key_ids = BTreeSet::new();
+    for (profile_id, current_profile) in &current.evidence.credential_profiles {
+        let Some(candidate_profile) = candidate.evidence.credential_profiles.get(profile_id) else {
             return Err(CredentialIssuerRotationError::RestartRequired);
         };
-        if candidate_profile.signing_key == current_profile.signing_key {
-            continue;
+        if candidate_profile.signing_key != current_profile.signing_key {
+            old_key_ids.insert(current_profile.signing_key.as_str());
         }
-        let Some(candidate_old_key) = candidate.signing_keys.get(&current_profile.signing_key)
-        else {
-            return Err(CredentialIssuerRotationError::Readiness);
-        };
-        if !candidate_old_key.may_publish_at(now) {
-            return Err(CredentialIssuerRotationError::Readiness);
-        }
-        let current_public = crate::standalone::signing_key_public_jwk_from_config(
-            current,
-            &current_profile.signing_key,
-        )
+    }
+    if current.auth.access_token_signing.signing_key_id
+        != candidate.auth.access_token_signing.signing_key_id
+    {
+        old_key_ids.insert(current.auth.access_token_signing.signing_key_id.as_str());
+    }
+    if current
+        .oid4vci
+        .pre_authorized_code
+        .esignet
+        .client_signing_key_id
+        != candidate
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id
+    {
+        old_key_ids.insert(
+            current
+                .oid4vci
+                .pre_authorized_code
+                .esignet
+                .client_signing_key_id
+                .as_str(),
+        );
+    }
+    for key_id in old_key_ids {
+        old_key_is_safe_for_rotation(&current.evidence, &candidate.evidence, key_id)?;
+    }
+    Ok(())
+}
+
+fn old_key_is_safe_for_rotation(
+    current: &EvidenceConfig,
+    candidate: &EvidenceConfig,
+    key_id: &str,
+) -> Result<(), CredentialIssuerRotationError> {
+    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+    let Some(candidate_old_key) = candidate.signing_keys.get(key_id) else {
+        return Err(CredentialIssuerRotationError::Readiness);
+    };
+    if !candidate_old_key.may_publish_at(now) {
+        return Err(CredentialIssuerRotationError::Readiness);
+    }
+    let current_public = crate::standalone::signing_key_public_jwk_from_config(current, key_id)
         .map_err(|_| CredentialIssuerRotationError::Readiness)?
         .ok_or(CredentialIssuerRotationError::Readiness)?;
-        let candidate_public = crate::standalone::signing_key_public_jwk_from_config(
-            candidate,
-            &current_profile.signing_key,
-        )
+    let candidate_public = crate::standalone::signing_key_public_jwk_from_config(candidate, key_id)
         .map_err(|_| CredentialIssuerRotationError::Readiness)?
         .ok_or(CredentialIssuerRotationError::Readiness)?;
-        if candidate_public != current_public {
-            return Err(CredentialIssuerRotationError::Readiness);
-        }
+    if candidate_public != current_public {
+        return Err(CredentialIssuerRotationError::Readiness);
     }
     Ok(())
 }
@@ -1643,13 +1780,14 @@ pub struct RegistryNotaryApiState {
     pub(crate) source: Arc<dyn SourceReader>,
     pub(crate) store: Arc<EvidenceStore>,
     issuer_runtime: Arc<RwLock<Arc<IssuerRuntimeBundle>>>,
+    auth_state: Option<Arc<AuthAuditState>>,
     pub(crate) posture: Option<Arc<PostureContext>>,
     config_governance: ConfigGovernanceContext,
     runtime_config: Arc<RwLock<Option<Arc<StandaloneRegistryNotaryConfig>>>>,
     config_apply_posture: Arc<RwLock<ConfigApplyPosture>>,
     /// Pre-authorized-code flow runtime. `None` unless the flow is enabled and
     /// the dedicated access-token signing key plus eSignet RP settings loaded.
-    pub(crate) preauth: Option<Arc<PreAuthRuntime>>,
+    pub(crate) preauth: Arc<RwLock<Option<Arc<PreAuthRuntime>>>>,
     #[cfg(feature = "registry-notary-cel")]
     pub(crate) cel_worker: Option<Arc<CelWorker>>,
     #[cfg(feature = "registry-notary-cel")]
@@ -1884,11 +2022,12 @@ impl RegistryNotaryApiState {
             source,
             store,
             issuer_runtime: Arc::new(RwLock::new(issuer_runtime)),
+            auth_state: None,
             posture: None,
             config_governance: ConfigGovernanceContext::default(),
             runtime_config: Arc::new(RwLock::new(None)),
             config_apply_posture: Arc::new(RwLock::new(ConfigApplyPosture::default())),
-            preauth: None,
+            preauth: Arc::new(RwLock::new(None)),
             #[cfg(feature = "registry-notary-cel")]
             cel_worker: None,
             #[cfg(feature = "registry-notary-cel")]
@@ -1897,8 +2036,17 @@ impl RegistryNotaryApiState {
     }
 
     #[must_use]
-    pub(crate) fn with_preauth_runtime(mut self, preauth: Option<Arc<PreAuthRuntime>>) -> Self {
-        self.preauth = preauth;
+    pub(crate) fn with_auth_state(mut self, auth_state: Arc<AuthAuditState>) -> Self {
+        self.auth_state = Some(auth_state);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_preauth_runtime(self, preauth: Option<Arc<PreAuthRuntime>>) -> Self {
+        *self
+            .preauth
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = preauth;
         self
     }
 
@@ -1985,6 +2133,32 @@ impl RegistryNotaryApiState {
             issuers,
             signer_readiness,
         });
+    }
+
+    fn swap_preauth_runtime(&self, preauth: Option<Arc<PreAuthRuntime>>) {
+        *self
+            .preauth
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = preauth;
+    }
+
+    fn notary_auth_anchor_for_config(
+        &self,
+        config: &StandaloneRegistryNotaryConfig,
+    ) -> Result<
+        Option<crate::standalone::NotaryTokenAnchor>,
+        crate::standalone::StandaloneServerError,
+    > {
+        if let Some(auth_state) = &self.auth_state {
+            return auth_state.notary_anchor_for_config(config);
+        }
+        Ok(None)
+    }
+
+    fn swap_notary_auth_anchor(&self, anchor: Option<crate::standalone::NotaryTokenAnchor>) {
+        if let (Some(auth_state), Some(anchor)) = (&self.auth_state, anchor) {
+            auth_state.swap_notary_anchor(anchor);
+        }
     }
 
     #[cfg(feature = "registry-notary-cel")]
@@ -2919,16 +3093,22 @@ async fn oid4vci_token(
         return token_error_response(TokenWireError::SlowDown);
     }
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let verified = match verify_notary_token(
-        code,
-        preauth.access_token_public_jwk(),
-        PRE_AUTHORIZED_CODE_JWT_TYP,
-        preauth.notary_issuer(),
-        &[],
-        now,
-    ) {
-        Ok(verified) => verified,
-        Err(_) => {
+    let verified = match preauth
+        .access_token_public_jwks()
+        .iter()
+        .find_map(|public_jwk| {
+            verify_notary_token(
+                code,
+                public_jwk,
+                PRE_AUTHORIZED_CODE_JWT_TYP,
+                preauth.notary_issuer(),
+                &[],
+                now,
+            )
+            .ok()
+        }) {
+        Some(verified) => verified,
+        None => {
             return token_error_after_invalid_attempt(
                 &state,
                 &preauth,
@@ -3077,7 +3257,11 @@ fn preauth_runtime(state: &RegistryNotaryApiState) -> Option<Arc<PreAuthRuntime>
     if !state.oid4vci.enabled {
         return None;
     }
-    state.preauth.clone()
+    state
+        .preauth
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Validate a requested `credential_configuration_id` against the configured
@@ -3117,9 +3301,8 @@ async fn consume_pre_authorized_code_jti(
     // Bound the single-use marker's storage to roughly the code lifetime.
     let expires_at = OffsetDateTime::from_unix_timestamp(now).map_err(|_| ())?
         + time::Duration::seconds(
-            state
-                .preauth
-                .as_ref()
+            preauth_runtime(state)
+                .as_deref()
                 .map(|preauth| preauth.pre_authorized_code_ttl_seconds())
                 .unwrap_or(300) as i64,
         );

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OnceCell, Semaphore};
@@ -118,6 +118,19 @@ pub(crate) fn credential_issuer_runtime_from_config(
     Ok((issuers, signer_readiness))
 }
 
+pub(crate) fn preauth_runtime_from_config_preserving_stores(
+    config: &StandaloneRegistryNotaryConfig,
+    previous: Option<&PreAuthRuntime>,
+) -> Result<Option<Arc<PreAuthRuntime>>, StandaloneServerError> {
+    let signing_keys = SigningKeyRegistry::from_config(&config.evidence)?;
+    let audit = previous
+        .map(|runtime| runtime.audit.clone())
+        .map(Ok)
+        .unwrap_or_else(|| AuditPipeline::from_config(&config.audit))?;
+    PreAuthRuntime::from_config_preserving_stores(config, &signing_keys, audit, previous)
+        .map(|runtime| runtime.map(Arc::new))
+}
+
 pub struct NotaryRuntimeSnapshot {
     metrics: Arc<AppMetrics>,
     auth_state: Arc<AuthAuditState>,
@@ -202,6 +215,7 @@ pub fn compile_notary_runtime(
         issuers,
         federation_signing_provider,
     )?
+    .with_auth_state(Arc::clone(&auth_state))
     .with_preauth_runtime(preauth_runtime)
     .with_signer_readiness(signer_readiness)
     .with_posture_context(posture_context)
@@ -1505,12 +1519,6 @@ impl SigningKeyRegistry {
     /// The public JWK for an active signing key, resolved by its config
     /// `key_id`. Used to seed the in-process Notary token verifier without an
     /// HTTP JWKS round-trip.
-    fn public_jwk_for_key_id(&self, key_id: &str) -> Option<PublicJwk> {
-        self.providers
-            .get(key_id)
-            .map(|provider| provider.public_jwk())
-    }
-
     fn signer_readiness(&self) -> SignerReadiness {
         SignerReadiness::from_entries(self.readiness_entries.clone())
     }
@@ -1840,8 +1848,8 @@ pub(crate) struct PreAuthRuntime {
     /// the access token). Distinct from the SD-JWT VC credential key (enforced
     /// by config validation).
     access_token_signer: Arc<dyn SigningProvider>,
-    /// Public JWK of the access-token key, for the in-process second verifier.
-    access_token_public_jwk: PublicJwk,
+    /// Public JWKs accepted by the in-process second verifier.
+    access_token_public_jwks: Vec<PublicJwk>,
     /// Notary issuer stamped into and pinned for Notary-minted tokens.
     notary_issuer: String,
     /// Audiences stamped into Notary access tokens.
@@ -1880,9 +1888,10 @@ pub(crate) struct PreAuthRuntime {
     esignet_id_token_verifier: Arc<TokenVerifier>,
     fetch_url_policy: FetchUrlPolicy,
     login_state_ttl_seconds: u64,
-    login_states: crate::preauth_state::SingleUseStore<crate::preauth_state::LoginState>,
+    login_states: Arc<crate::preauth_state::SingleUseStore<crate::preauth_state::LoginState>>,
     /// Per-code `tx_code` PIN sessions keyed by the pre-authorized code `jti`.
-    tx_code_sessions: crate::preauth_state::SingleUseStore<crate::preauth_state::TxCodeSession>,
+    tx_code_sessions:
+        Arc<crate::preauth_state::SingleUseStore<crate::preauth_state::TxCodeSession>>,
     /// Audit pipeline so the callback and token endpoints (public, so not
     /// covered by the auth-audit middleware) can emit hashed audit events.
     audit: AuditPipeline,
@@ -1973,6 +1982,15 @@ impl PreAuthRuntime {
         signing_keys: &SigningKeyRegistry,
         audit: AuditPipeline,
     ) -> Result<Option<Self>, StandaloneServerError> {
+        Self::from_config_preserving_stores(config, signing_keys, audit, None)
+    }
+
+    fn from_config_preserving_stores(
+        config: &StandaloneRegistryNotaryConfig,
+        signing_keys: &SigningKeyRegistry,
+        audit: AuditPipeline,
+        previous: Option<&PreAuthRuntime>,
+    ) -> Result<Option<Self>, StandaloneServerError> {
         let pre_auth = &config.oid4vci.pre_authorized_code;
         let signing = &config.auth.access_token_signing;
         if !pre_auth.enabled {
@@ -1992,7 +2010,7 @@ impl PreAuthRuntime {
                     "active access-token signing key was not built",
                 )
             })?;
-        let access_token_public_jwk = access_token_signer.public_jwk();
+        let access_token_public_jwks = access_token_verification_jwks(config)?;
         let esignet = &pre_auth.esignet;
         let esignet_client_signer = signing_keys
             .signing_provider(esignet.client_signing_key_id.as_str())
@@ -2018,7 +2036,7 @@ impl PreAuthRuntime {
         ));
         Ok(Some(Self {
             access_token_signer,
-            access_token_public_jwk,
+            access_token_public_jwks,
             notary_issuer: signing.issuer.clone(),
             notary_audiences: signing.audiences.clone(),
             access_token_typ: signing.token_typ.clone(),
@@ -2041,8 +2059,12 @@ impl PreAuthRuntime {
             esignet_id_token_verifier,
             fetch_url_policy,
             login_state_ttl_seconds: esignet.login_state_ttl_seconds,
-            login_states: crate::preauth_state::SingleUseStore::new(),
-            tx_code_sessions: crate::preauth_state::SingleUseStore::new(),
+            login_states: previous
+                .map(|runtime| Arc::clone(&runtime.login_states))
+                .unwrap_or_else(|| Arc::new(crate::preauth_state::SingleUseStore::new())),
+            tx_code_sessions: previous
+                .map(|runtime| Arc::clone(&runtime.tx_code_sessions))
+                .unwrap_or_else(|| Arc::new(crate::preauth_state::SingleUseStore::new())),
             audit,
         }))
     }
@@ -2057,8 +2079,8 @@ impl PreAuthRuntime {
         self.access_token_signer.as_ref()
     }
 
-    pub(crate) fn access_token_public_jwk(&self) -> &PublicJwk {
-        &self.access_token_public_jwk
+    pub(crate) fn access_token_public_jwks(&self) -> &[PublicJwk] {
+        &self.access_token_public_jwks
     }
 
     pub(crate) fn notary_issuer(&self) -> &str {
@@ -2096,13 +2118,13 @@ impl PreAuthRuntime {
     pub(crate) fn login_states(
         &self,
     ) -> &crate::preauth_state::SingleUseStore<crate::preauth_state::LoginState> {
-        &self.login_states
+        self.login_states.as_ref()
     }
 
     pub(crate) fn tx_code_sessions(
         &self,
     ) -> &crate::preauth_state::SingleUseStore<crate::preauth_state::TxCodeSession> {
-        &self.tx_code_sessions
+        self.tx_code_sessions.as_ref()
     }
 
     /// Build the eSignet authorization redirect URL for the citizen browser.
@@ -2392,6 +2414,35 @@ impl PreAuthRuntime {
             .map_err(|_| EvidenceError::MissingCredential)?;
         Ok(format!("{signing_input}.{}", base64_url_no_pad(&signature)))
     }
+}
+
+fn access_token_verification_jwks(
+    config: &StandaloneRegistryNotaryConfig,
+) -> Result<Vec<PublicJwk>, StandaloneServerError> {
+    let signing = &config.auth.access_token_signing;
+    let mut jwks = Vec::with_capacity(1 + signing.verification_key_ids.len());
+    jwks.push(
+        signing_key_public_jwk_from_config(&config.evidence, signing.signing_key_id.as_str())?
+            .ok_or_else(|| {
+                invalid_signing_key(
+                    signing.signing_key_id.as_str(),
+                    "access-token signing key public JWK was not built",
+                )
+            })?,
+    );
+    let now = current_unix_timestamp_seconds();
+    for key_id in &signing.verification_key_ids {
+        let Some(key) = config.evidence.signing_keys.get(key_id) else {
+            continue;
+        };
+        if !key.may_publish_at(now) {
+            continue;
+        }
+        if let Some(public_jwk) = signing_key_public_jwk_from_config(&config.evidence, key_id)? {
+            jwks.push(public_jwk);
+        }
+    }
+    Ok(jwks)
 }
 
 /// Constant-time byte comparison so secret comparisons (nonce, `tx_code`) do
@@ -2955,7 +3006,7 @@ impl std::fmt::Debug for ResolvedCredential {
 }
 
 #[derive(Debug)]
-struct AuthAuditState {
+pub(crate) struct AuthAuditState {
     authenticator: Authenticator,
     audit: AuditPipeline,
     metrics: Arc<AppMetrics>,
@@ -2998,7 +3049,7 @@ enum Authenticator {
         /// is enabled. Dispatched by the UNVERIFIED `iss` (route-only) and fully
         /// verified against its own key + issuer + typ. Boxed to keep the enum
         /// variants similarly sized.
-        notary_anchor: Option<Box<NotaryTokenAnchor>>,
+        notary_anchor: Option<Arc<RwLock<NotaryTokenAnchor>>>,
     },
 }
 
@@ -3006,8 +3057,8 @@ enum Authenticator {
 /// pinned issuer, header `typ`, and accepted audiences. Verification is fully
 /// in-process (no self-HTTP-call to a JWKS endpoint).
 #[derive(Clone)]
-struct NotaryTokenAnchor {
-    public_jwk: PublicJwk,
+pub(crate) struct NotaryTokenAnchor {
+    public_jwks: Vec<PublicJwk>,
     issuer: String,
     token_typ: String,
     audiences: Vec<String>,
@@ -3055,6 +3106,39 @@ impl AuthAuditState {
         credentials: RequestCredentials,
     ) -> Result<EvidencePrincipal, EvidenceError> {
         self.authenticator.authenticate(credentials).await
+    }
+
+    pub(crate) fn notary_anchor_for_config(
+        &self,
+        config: &StandaloneRegistryNotaryConfig,
+    ) -> Result<Option<NotaryTokenAnchor>, StandaloneServerError> {
+        let Authenticator::Oidc {
+            principal_claim,
+            subject_binding_claim,
+            notary_anchor: Some(_),
+            ..
+        } = &self.authenticator
+        else {
+            return Ok(None);
+        };
+        Authenticator::build_notary_anchor_value(
+            config,
+            principal_claim.clone(),
+            subject_binding_claim.clone(),
+        )
+    }
+
+    pub(crate) fn swap_notary_anchor(&self, updated: NotaryTokenAnchor) {
+        let Authenticator::Oidc {
+            notary_anchor: Some(anchor),
+            ..
+        } = &self.authenticator
+        else {
+            return;
+        };
+        *anchor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = updated;
     }
 }
 
@@ -3181,8 +3265,11 @@ impl Authenticator {
                 // everything else takes the existing eSignet path unchanged.
                 if let Some(anchor) = notary_anchor {
                     if let Some(token) = credentials.bearer_token.as_deref() {
+                        let anchor = anchor
+                            .read()
+                            .map_err(|_| EvidenceError::MissingCredential)?;
                         if unverified_issuer(token).as_deref() == Some(anchor.issuer.as_str()) {
-                            return authenticate_notary_token(token, anchor);
+                            return authenticate_notary_token(token, &anchor);
                         }
                     }
                 }
@@ -3208,31 +3295,30 @@ impl Authenticator {
         config: &StandaloneRegistryNotaryConfig,
         principal_claim: String,
         subject_binding_claim: Option<String>,
-    ) -> Result<Option<Box<NotaryTokenAnchor>>, StandaloneServerError> {
+    ) -> Result<Option<Arc<RwLock<NotaryTokenAnchor>>>, StandaloneServerError> {
+        Ok(
+            Self::build_notary_anchor_value(config, principal_claim, subject_binding_claim)?
+                .map(|anchor| Arc::new(RwLock::new(anchor))),
+        )
+    }
+
+    fn build_notary_anchor_value(
+        config: &StandaloneRegistryNotaryConfig,
+        principal_claim: String,
+        subject_binding_claim: Option<String>,
+    ) -> Result<Option<NotaryTokenAnchor>, StandaloneServerError> {
         let signing = &config.auth.access_token_signing;
         if !signing.enabled {
             return Ok(None);
         }
-        // Resolve the access-token key's public JWK by loading the signing-key
-        // registry (the same loader the issuer registry uses). Config
-        // validation already enforces this key is distinct from credential keys.
-        let signing_keys = SigningKeyRegistry::from_config(&config.evidence)?;
-        let public_jwk = signing_keys
-            .public_jwk_for_key_id(signing.signing_key_id.as_str())
-            .ok_or_else(|| {
-                invalid_signing_key(
-                    signing.signing_key_id.as_str(),
-                    "access-token signing key public JWK was not built",
-                )
-            })?;
-        Ok(Some(Box::new(NotaryTokenAnchor {
-            public_jwk,
+        Ok(Some(NotaryTokenAnchor {
+            public_jwks: access_token_verification_jwks(config)?,
             issuer: signing.issuer.clone(),
             token_typ: signing.token_typ.clone(),
             audiences: signing.audiences.clone(),
             principal_claim,
             subject_binding_claim,
-        })))
+        }))
     }
 }
 
@@ -3892,14 +3978,21 @@ fn authenticate_notary_token(
     anchor: &NotaryTokenAnchor,
 ) -> Result<EvidencePrincipal, EvidenceError> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let verified_notary = registry_notary_core::tokens::verify_notary_token(
-        token,
-        &anchor.public_jwk,
-        &anchor.token_typ,
-        &anchor.issuer,
-        &anchor.audiences,
-        now,
-    )?;
+    let verified_notary = anchor
+        .public_jwks
+        .iter()
+        .find_map(|public_jwk| {
+            registry_notary_core::tokens::verify_notary_token(
+                token,
+                public_jwk,
+                &anchor.token_typ,
+                &anchor.issuer,
+                &anchor.audiences,
+                now,
+            )
+            .ok()
+        })
+        .ok_or(EvidenceError::MissingCredential)?;
     let verified = verified_token_from_notary_payload(&verified_notary.payload)
         .ok_or(EvidenceError::MissingCredential)?;
     // Notary tokens carry the assurance and subject-binding claims in the access
