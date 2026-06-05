@@ -38,7 +38,9 @@ use registry_notary_core::{
     SubjectRequest, VerifiedClaimValue, FORMAT_CLAIM_RESULT_JSON, FORMAT_SD_JWT_VC,
 };
 use registry_platform_audit::AuditKeyHasher;
-use registry_platform_config::{LocalTufRepositoryInput, TufConfigVerifier, VerificationContext};
+use registry_platform_config::{
+    LocalTufRepositoryInput, RegistryTrustRoot, TufConfigVerifier, VerificationContext,
+};
 use registry_platform_crypto::KeyReadiness;
 use registry_platform_crypto::PublicJwk;
 use registry_platform_crypto::SigningProvider;
@@ -53,7 +55,8 @@ use registry_platform_oid4vci::{
 use registry_platform_ops::{
     internal_config_hash, posture_safe_runtime_config_hash, AntiRollbackKey, AntiRollbackProposal,
     AntiRollbackStoreError, ApplyReportResult, BreakGlassApproval, BreakGlassRateLimit,
-    ConfigSource, FileAntiRollbackStore, PostureApplyResult, PostureFilterError,
+    ConfigSource, FileAntiRollbackStore, FileLocalApprovalStore, LocalApprovalStoreError,
+    LocalOperatorApproval, PostureApplyResult, PostureFilterError,
 };
 use registry_platform_replay::{ReplayKey, ReplayScope, RequiredReplayError};
 use registry_platform_sdjwt::{validate_holder_proof, HolderProofBindings, HolderProofPolicy};
@@ -164,6 +167,8 @@ struct ConfigApplyRequest {
     break_glass_approval: Option<BreakGlassApproval>,
     #[serde(default)]
     break_glass_rate_limit: Option<BreakGlassRateLimit>,
+    #[serde(default)]
+    local_approval_reference: Option<String>,
     #[serde(default)]
     tuf: Option<LocalTufConfigTargetRequest>,
 }
@@ -595,33 +600,55 @@ async fn admin_config_apply(
             ),
         );
     }
-    let signing_change_authorization = signing_change_authorization(&candidate);
-    if !signing_change_authorization.any() {
-        consume_apply_metadata(&request);
-        return config_apply_report(
-            candidate.bundle_id.clone(),
-            candidate.sequence,
-            ApplyReportResult::RejectedRestartRequired,
-            false,
-            true,
-            StatusCode::CONFLICT,
-            resolved_config_audit(
-                ConfigAdminAction::Apply,
-                &candidate,
-                "accepted",
-                ApplyReportResult::RejectedRestartRequired.as_str(),
-                false,
-                true,
-            ),
-        );
-    }
-    let issuer_rotation = match classify_credential_issuer_rotation(
-        &state,
-        &candidate_config,
-        signing_change_authorization,
-    ) {
-        Ok(rotation) => rotation,
-        Err(CredentialIssuerRotationError::RestartRequired) => {
+    let governed_apply = if root_transition_authorized(&candidate) {
+        match classify_root_transition(&state, &candidate_config) {
+            Ok(()) => match load_root_transition_local_approval(&request, &state, &candidate) {
+                Ok(local_approval) => GovernedConfigApply::RootTransition { local_approval },
+                Err(_) => {
+                    consume_apply_metadata(&request);
+                    return config_apply_report(
+                        candidate.bundle_id.clone(),
+                        candidate.sequence,
+                        ApplyReportResult::RejectedLocalApproval,
+                        false,
+                        false,
+                        StatusCode::CONFLICT,
+                        resolved_config_audit(
+                            ConfigAdminAction::Apply,
+                            &candidate,
+                            "accepted",
+                            ApplyReportResult::RejectedLocalApproval.as_str(),
+                            false,
+                            false,
+                        )
+                        .with_local_approval_request(&request),
+                    );
+                }
+            },
+            Err(RootTransitionError::RestartRequired) => {
+                consume_apply_metadata(&request);
+                return config_apply_report(
+                    candidate.bundle_id.clone(),
+                    candidate.sequence,
+                    ApplyReportResult::RejectedRestartRequired,
+                    false,
+                    true,
+                    StatusCode::CONFLICT,
+                    resolved_config_audit(
+                        ConfigAdminAction::Apply,
+                        &candidate,
+                        "accepted",
+                        ApplyReportResult::RejectedRestartRequired.as_str(),
+                        false,
+                        true,
+                    )
+                    .with_local_approval_request(&request),
+                );
+            }
+        }
+    } else {
+        let signing_change_authorization = signing_change_authorization(&candidate);
+        if !signing_change_authorization.any() {
             consume_apply_metadata(&request);
             return config_apply_report(
                 candidate.bundle_id.clone(),
@@ -640,49 +667,80 @@ async fn admin_config_apply(
                 ),
             );
         }
-        Err(CredentialIssuerRotationError::Readiness) => {
-            consume_apply_metadata(&request);
-            return config_apply_report(
-                candidate.bundle_id.clone(),
-                candidate.sequence,
-                ApplyReportResult::RejectedReadiness,
-                false,
-                false,
-                StatusCode::CONFLICT,
-                resolved_config_audit(
-                    ConfigAdminAction::Apply,
-                    &candidate,
-                    "rejected",
-                    ApplyReportResult::RejectedReadiness.as_str(),
+        let issuer_rotation = match classify_credential_issuer_rotation(
+            &state,
+            &candidate_config,
+            signing_change_authorization,
+        ) {
+            Ok(rotation) => rotation,
+            Err(CredentialIssuerRotationError::RestartRequired) => {
+                consume_apply_metadata(&request);
+                return config_apply_report(
+                    candidate.bundle_id.clone(),
+                    candidate.sequence,
+                    ApplyReportResult::RejectedRestartRequired,
+                    false,
+                    true,
+                    StatusCode::CONFLICT,
+                    resolved_config_audit(
+                        ConfigAdminAction::Apply,
+                        &candidate,
+                        "accepted",
+                        ApplyReportResult::RejectedRestartRequired.as_str(),
+                        false,
+                        true,
+                    ),
+                );
+            }
+            Err(CredentialIssuerRotationError::Readiness) => {
+                consume_apply_metadata(&request);
+                return config_apply_report(
+                    candidate.bundle_id.clone(),
+                    candidate.sequence,
+                    ApplyReportResult::RejectedReadiness,
                     false,
                     false,
-                ),
-            );
+                    StatusCode::CONFLICT,
+                    resolved_config_audit(
+                        ConfigAdminAction::Apply,
+                        &candidate,
+                        "rejected",
+                        ApplyReportResult::RejectedReadiness.as_str(),
+                        false,
+                        false,
+                    ),
+                );
+            }
+        };
+        let notary_auth_anchor = match state.notary_auth_anchor_for_config(&candidate_config) {
+            Ok(anchor) => anchor,
+            Err(_) => {
+                return config_apply_report(
+                    candidate.bundle_id.clone(),
+                    candidate.sequence,
+                    ApplyReportResult::RejectedReadiness,
+                    false,
+                    false,
+                    StatusCode::CONFLICT,
+                    resolved_config_audit(
+                        ConfigAdminAction::Apply,
+                        &candidate,
+                        "rejected",
+                        ApplyReportResult::RejectedReadiness.as_str(),
+                        false,
+                        false,
+                    ),
+                );
+            }
+        };
+        GovernedConfigApply::SigningRotation {
+            issuer_rotation,
+            notary_auth_anchor,
         }
     };
     let candidate_config = Arc::new(candidate_config);
-    let notary_auth_anchor = match state.notary_auth_anchor_for_config(&candidate_config) {
-        Ok(anchor) => anchor,
-        Err(_) => {
-            return config_apply_report(
-                candidate.bundle_id.clone(),
-                candidate.sequence,
-                ApplyReportResult::RejectedReadiness,
-                false,
-                false,
-                StatusCode::CONFLICT,
-                resolved_config_audit(
-                    ConfigAdminAction::Apply,
-                    &candidate,
-                    "rejected",
-                    ApplyReportResult::RejectedReadiness.as_str(),
-                    false,
-                    false,
-                ),
-            );
-        }
-    };
-    let Some(config_trust) = &state.config_governance.config_trust else {
+    let config_governance = state.config_governance();
+    let Some(config_trust) = &config_governance.config_trust else {
         return with_config_audit(
             config_apply_unavailable("config_trust.antirollback_state_path is not configured"),
             resolved_config_audit(
@@ -696,8 +754,9 @@ async fn admin_config_apply(
         );
     };
     let antirollback_store = FileAntiRollbackStore::new(&config_trust.antirollback_state_path);
+    let local_approval = governed_apply.local_approval().cloned();
     if let Err(error) = antirollback_store.accept(
-        &antirollback_key(&state.config_governance, &candidate.stream_id),
+        &antirollback_key(&config_governance, &candidate.stream_id),
         AntiRollbackProposal {
             sequence: candidate.sequence,
             previous_config_hash: candidate.previous_config_hash.clone(),
@@ -705,12 +764,14 @@ async fn admin_config_apply(
             root_version: candidate.root_version,
             break_glass: break_glass.0,
             break_glass_rate_limit: break_glass.1,
-            local_approval: None,
-            local_approval_rate_limit: None,
+            local_approval: local_approval.clone(),
+            local_approval_rate_limit: local_approval.as_ref().map(|approval| approval.rate_limit),
         },
     ) {
         let result = if is_break_glass_error(&error) {
             ApplyReportResult::RejectedBreakGlass
+        } else if is_local_approval_error(&error) {
+            ApplyReportResult::RejectedLocalApproval
         } else {
             ApplyReportResult::RejectedRollback
         };
@@ -729,18 +790,30 @@ async fn admin_config_apply(
                 false,
                 false,
             )
-            .with_break_glass_request(&request),
+            .with_break_glass_request(&request)
+            .with_local_approval(local_approval.as_ref()),
         );
     }
     consume_apply_metadata(&request);
-    state.swap_notary_auth_anchor(notary_auth_anchor);
-    state.swap_issuer_runtime(
-        candidate_config.clone(),
-        issuer_rotation.issuers,
-        issuer_rotation.signer_readiness,
-    );
-    state.swap_preauth_runtime(issuer_rotation.preauth);
-    state.swap_federation_runtime(issuer_rotation.federation);
+    match governed_apply {
+        GovernedConfigApply::SigningRotation {
+            issuer_rotation,
+            notary_auth_anchor,
+        } => {
+            state.swap_notary_auth_anchor(notary_auth_anchor);
+            state.swap_issuer_runtime(
+                candidate_config.clone(),
+                issuer_rotation.issuers,
+                issuer_rotation.signer_readiness,
+            );
+            state.swap_preauth_runtime(issuer_rotation.preauth);
+            state.swap_federation_runtime(issuer_rotation.federation);
+        }
+        GovernedConfigApply::RootTransition { .. } => {
+            state.swap_runtime_config(candidate_config.clone());
+        }
+    }
+    state.swap_config_governance(ConfigGovernanceContext::from_config(&candidate_config));
     state.record_config_apply(ConfigApplyPosture {
         source: candidate.source,
         last_config_hash: Some(posture_hash(&candidate_config)),
@@ -765,7 +838,8 @@ async fn admin_config_apply(
             true,
             false,
         )
-        .with_break_glass_request(&request),
+        .with_break_glass_request(&request)
+        .with_local_approval(local_approval.as_ref()),
     )
 }
 
@@ -838,6 +912,16 @@ fn is_break_glass_error(error: &AntiRollbackStoreError) -> bool {
     )
 }
 
+fn is_local_approval_error(error: &AntiRollbackStoreError) -> bool {
+    matches!(
+        error,
+        AntiRollbackStoreError::LocalApprovalExpired
+            | AntiRollbackStoreError::LocalApprovalRateLimitMissing
+            | AntiRollbackStoreError::LocalApprovalRateLimited
+            | AntiRollbackStoreError::InvalidLocalApproval(_)
+    )
+}
+
 fn require_admin_scope_error(principal: Option<Extension<EvidencePrincipal>>) -> Option<Response> {
     let Some(Extension(principal)) = principal else {
         return Some(evidence_error_response(EvidenceError::MissingCredential));
@@ -871,6 +955,121 @@ struct CredentialIssuerRotation {
 enum CredentialIssuerRotationError {
     RestartRequired,
     Readiness,
+}
+
+enum GovernedConfigApply {
+    SigningRotation {
+        issuer_rotation: CredentialIssuerRotation,
+        notary_auth_anchor: Option<crate::standalone::NotaryTokenAnchor>,
+    },
+    RootTransition {
+        local_approval: LocalOperatorApproval,
+    },
+}
+
+impl GovernedConfigApply {
+    fn local_approval(&self) -> Option<&LocalOperatorApproval> {
+        match self {
+            Self::SigningRotation { .. } => None,
+            Self::RootTransition { local_approval } => Some(local_approval),
+        }
+    }
+}
+
+enum RootTransitionError {
+    RestartRequired,
+}
+
+fn root_transition_authorized(candidate: &ResolvedConfigCandidate) -> bool {
+    candidate.source == ConfigSource::SignedBundleFile
+        && candidate.change_classes.contains("root_transition")
+}
+
+fn classify_root_transition(
+    state: &RegistryNotaryApiState,
+    candidate: &StandaloneRegistryNotaryConfig,
+) -> Result<(), RootTransitionError> {
+    let Some(current) = state.runtime_config() else {
+        return Err(RootTransitionError::RestartRequired);
+    };
+    let Some(current_trust) = &current.config_trust else {
+        return Err(RootTransitionError::RestartRequired);
+    };
+    let Some(candidate_trust) = &candidate.config_trust else {
+        return Err(RootTransitionError::RestartRequired);
+    };
+    if current_trust.antirollback_state_path != candidate_trust.antirollback_state_path
+        || current_trust.local_approval_state_path != candidate_trust.local_approval_state_path
+        || candidate_trust.accepted_roots.is_empty()
+        || current_trust.accepted_roots == candidate_trust.accepted_roots
+        || !root_ids_are_unique(&current_trust.accepted_roots)
+        || !root_ids_are_unique(&candidate_trust.accepted_roots)
+    {
+        return Err(RootTransitionError::RestartRequired);
+    }
+    for current_root in &current_trust.accepted_roots {
+        if let Some(candidate_root) = candidate_trust
+            .accepted_roots
+            .iter()
+            .find(|root| root.root_id == current_root.root_id)
+        {
+            if candidate_root != current_root {
+                return Err(RootTransitionError::RestartRequired);
+            }
+        }
+    }
+    if !equivalent_except_config_trust_accepted_roots(&current, candidate)
+        .map_err(|_| RootTransitionError::RestartRequired)?
+    {
+        return Err(RootTransitionError::RestartRequired);
+    }
+    Ok(())
+}
+
+fn root_ids_are_unique(roots: &[RegistryTrustRoot]) -> bool {
+    let mut seen = BTreeSet::new();
+    roots.iter().all(|root| seen.insert(root.root_id.as_str()))
+}
+
+fn equivalent_except_config_trust_accepted_roots(
+    current: &StandaloneRegistryNotaryConfig,
+    candidate: &StandaloneRegistryNotaryConfig,
+) -> Result<bool, &'static str> {
+    let mut current =
+        serde_json::to_value(current).map_err(|_| "current config could not be normalized")?;
+    let mut candidate =
+        serde_json::to_value(candidate).map_err(|_| "candidate config could not be normalized")?;
+    normalize_config_trust_accepted_roots(&mut current);
+    normalize_config_trust_accepted_roots(&mut candidate);
+    Ok(current == candidate)
+}
+
+fn normalize_config_trust_accepted_roots(value: &mut Value) {
+    if let Some(config_trust) = value.get_mut("config_trust").and_then(Value::as_object_mut) {
+        config_trust.insert("accepted_roots".to_string(), Value::Array(Vec::new()));
+    }
+}
+
+fn load_root_transition_local_approval(
+    request: &ConfigApplyRequest,
+    state: &RegistryNotaryApiState,
+    candidate: &ResolvedConfigCandidate,
+) -> Result<LocalOperatorApproval, LocalApprovalStoreError> {
+    let approval_reference = request
+        .local_approval_reference
+        .as_deref()
+        .ok_or(LocalApprovalStoreError::ApprovalNotFound)?;
+    let governance = state.config_governance();
+    let config_trust = governance
+        .config_trust
+        .as_ref()
+        .ok_or(LocalApprovalStoreError::MissingState)?;
+    FileLocalApprovalStore::new(&config_trust.local_approval_state_path).load_for_apply(
+        approval_reference,
+        "root_transition",
+        &internal_config_hash(candidate.config_yaml.as_bytes()),
+        candidate.previous_config_hash.as_deref(),
+    )
 }
 
 fn classify_credential_issuer_rotation(
@@ -1297,7 +1496,8 @@ async fn resolve_tuf_config_candidate(
     request: &LocalTufConfigTargetRequest,
     state: &RegistryNotaryApiState,
 ) -> Result<ResolvedConfigCandidate, ConfigCandidateError> {
-    let Some(config_trust) = &state.config_governance.config_trust else {
+    let config_governance = state.config_governance();
+    let Some(config_trust) = &config_governance.config_trust else {
         return Err(ConfigCandidateError::BundleInvalid(
             "signed config trust roots are not configured",
         ));
@@ -1309,8 +1509,8 @@ async fn resolve_tuf_config_candidate(
     }
     let context = VerificationContext {
         product: "registry-notary".to_string(),
-        instance_id: state.config_governance.instance_id.clone(),
-        environment: state.config_governance.environment.clone(),
+        instance_id: config_governance.instance_id.clone(),
+        environment: config_governance.environment.clone(),
     };
     let input = LocalTufRepositoryInput {
         root_path: request.root_path.clone(),
@@ -1360,6 +1560,7 @@ fn consume_apply_metadata(request: &ConfigApplyRequest) {
         request.break_glass,
         request.break_glass_approval.as_ref(),
         request.break_glass_rate_limit,
+        request.local_approval_reference.as_deref(),
         request.bundle_id.as_deref(),
         request.sequence,
     );
@@ -1451,6 +1652,12 @@ fn unresolved_config_audit(
         break_glass_emergency_change_class: None,
         break_glass_expires_at_unix_seconds: None,
         break_glass_rate_limit_identity: None,
+        local_approval_reference: request.local_approval_reference.clone(),
+        local_approval_approved_by: None,
+        local_approval_reason_hash: None,
+        local_approval_change_class: None,
+        local_approval_expires_at_unix_seconds: None,
+        local_approval_rate_limit_identity: None,
     }
 }
 
@@ -1483,6 +1690,12 @@ fn resolved_config_audit(
         break_glass_emergency_change_class: None,
         break_glass_expires_at_unix_seconds: None,
         break_glass_rate_limit_identity: None,
+        local_approval_reference: None,
+        local_approval_approved_by: None,
+        local_approval_reason_hash: None,
+        local_approval_change_class: None,
+        local_approval_expires_at_unix_seconds: None,
+        local_approval_rate_limit_identity: None,
     }
 }
 
@@ -1500,6 +1713,31 @@ impl ConfigAuditBreakGlassExt for ConfigAuditEvent {
             self.break_glass_emergency_change_class = Some(approval.emergency_change_class.clone());
             self.break_glass_expires_at_unix_seconds = Some(approval.expires_at_unix_seconds);
             self.break_glass_rate_limit_identity = Some(approval.rate_limit_identity.clone());
+        }
+        self
+    }
+}
+
+trait ConfigAuditLocalApprovalExt {
+    fn with_local_approval_request(self, request: &ConfigApplyRequest) -> Self;
+    fn with_local_approval(self, approval: Option<&LocalOperatorApproval>) -> Self;
+}
+
+impl ConfigAuditLocalApprovalExt for ConfigAuditEvent {
+    fn with_local_approval_request(mut self, request: &ConfigApplyRequest) -> Self {
+        self.local_approval_reference = request.local_approval_reference.clone();
+        self
+    }
+
+    fn with_local_approval(mut self, approval: Option<&LocalOperatorApproval>) -> Self {
+        if let Some(approval) = approval {
+            self.local_approval_reference = Some(approval.approval_reference.clone());
+            self.local_approval_approved_by = Some(approval.approved_by.clone());
+            self.local_approval_reason_hash =
+                Some(internal_config_hash(approval.reason.as_bytes()));
+            self.local_approval_change_class = Some(approval.change_class.clone());
+            self.local_approval_expires_at_unix_seconds = Some(approval.expires_at_unix_seconds);
+            self.local_approval_rate_limit_identity = Some(approval.rate_limit_identity.clone());
         }
         self
     }
@@ -1525,6 +1763,9 @@ fn apply_result_to_posture_audit(apply_result: &str) -> &'static str {
                 .as_str()
         }
         "rejected_break_glass" => ApplyReportResult::RejectedBreakGlass
+            .as_posture_result()
+            .as_str(),
+        "rejected_local_approval" => ApplyReportResult::RejectedLocalApproval
             .as_posture_result()
             .as_str(),
         "rejected_rollback"
@@ -1965,7 +2206,7 @@ pub struct RegistryNotaryApiState {
     issuer_runtime: Arc<RwLock<Arc<IssuerRuntimeBundle>>>,
     auth_state: Option<Arc<AuthAuditState>>,
     pub(crate) posture: Option<Arc<PostureContext>>,
-    config_governance: ConfigGovernanceContext,
+    config_governance: Arc<RwLock<ConfigGovernanceContext>>,
     runtime_config: Arc<RwLock<Option<Arc<StandaloneRegistryNotaryConfig>>>>,
     config_apply_posture: Arc<RwLock<ConfigApplyPosture>>,
     /// Pre-authorized-code flow runtime. `None` unless the flow is enabled and
@@ -2207,7 +2448,7 @@ impl RegistryNotaryApiState {
             issuer_runtime: Arc::new(RwLock::new(issuer_runtime)),
             auth_state: None,
             posture: None,
-            config_governance: ConfigGovernanceContext::default(),
+            config_governance: Arc::new(RwLock::new(ConfigGovernanceContext::default())),
             runtime_config: Arc::new(RwLock::new(None)),
             config_apply_posture: Arc::new(RwLock::new(ConfigApplyPosture::default())),
             preauth: Arc::new(RwLock::new(None)),
@@ -2250,8 +2491,11 @@ impl RegistryNotaryApiState {
         self
     }
 
-    pub(crate) fn with_config_governance(mut self, context: ConfigGovernanceContext) -> Self {
-        self.config_governance = context;
+    pub(crate) fn with_config_governance(self, context: ConfigGovernanceContext) -> Self {
+        *self
+            .config_governance
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = context;
         self
     }
 
@@ -2268,6 +2512,27 @@ impl RegistryNotaryApiState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn swap_runtime_config(&self, config: Arc<StandaloneRegistryNotaryConfig>) {
+        *self
+            .runtime_config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config);
+    }
+
+    fn config_governance(&self) -> ConfigGovernanceContext {
+        self.config_governance
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn swap_config_governance(&self, context: ConfigGovernanceContext) {
+        *self
+            .config_governance
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = context;
     }
 
     pub(crate) fn federation_runtime(

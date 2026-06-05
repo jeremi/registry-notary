@@ -1341,6 +1341,18 @@ pub struct ConfigAuditEvent {
     pub break_glass_expires_at_unix_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub break_glass_rate_limit_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_approved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_reason_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_change_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_expires_at_unix_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_approval_rate_limit_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -80,6 +80,7 @@ pub struct NotaryInstanceConfig {
 #[serde(deny_unknown_fields)]
 pub struct ConfigTrustConfig {
     pub antirollback_state_path: PathBuf,
+    pub local_approval_state_path: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_roots: Vec<RegistryTrustRoot>,
 }
@@ -117,6 +118,15 @@ impl StandaloneRegistryNotaryConfig {
             if config_trust.antirollback_state_path.as_os_str().is_empty() {
                 return Err(EvidenceConfigError::InvalidConfigTrustConfig {
                     reason: "config_trust.antirollback_state_path must not be empty".to_string(),
+                });
+            }
+            if config_trust
+                .local_approval_state_path
+                .as_os_str()
+                .is_empty()
+            {
+                return Err(EvidenceConfigError::InvalidConfigTrustConfig {
+                    reason: "config_trust.local_approval_state_path must not be empty".to_string(),
                 });
             }
             for root in &config_trust.accepted_roots {
@@ -4782,6 +4792,9 @@ rule:
 
         config.config_trust = Some(ConfigTrustConfig {
             antirollback_state_path: PathBuf::from(""),
+            local_approval_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-local-approvals.json",
+            ),
             accepted_roots: Vec::new(),
         });
         let error = config
@@ -4796,11 +4809,29 @@ rule:
             antirollback_state_path: PathBuf::from(
                 "/var/lib/registry-notary/config-antirollback.json",
             ),
+            local_approval_state_path: PathBuf::from(""),
+            accepted_roots: Vec::new(),
+        });
+        let error = config
+            .validate()
+            .expect_err("empty local-approval path must fail validation");
+        assert!(matches!(
+            error,
+            EvidenceConfigError::InvalidConfigTrustConfig { .. }
+        ));
+
+        config.config_trust = Some(ConfigTrustConfig {
+            antirollback_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-antirollback.json",
+            ),
+            local_approval_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-local-approvals.json",
+            ),
             accepted_roots: Vec::new(),
         });
         config
             .validate()
-            .expect("explicit governed-state path validates");
+            .expect("explicit governed-state paths validate");
     }
 
     #[test]
@@ -4809,6 +4840,9 @@ rule:
         config.config_trust = Some(ConfigTrustConfig {
             antirollback_state_path: PathBuf::from(
                 "/var/lib/registry-notary/config-antirollback.json",
+            ),
+            local_approval_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-local-approvals.json",
             ),
             accepted_roots: vec![RegistryTrustRoot {
                 root_id: "ops-root".to_string(),

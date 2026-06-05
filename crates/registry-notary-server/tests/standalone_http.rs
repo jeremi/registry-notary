@@ -35,7 +35,8 @@ use registry_platform_config::{RegistryTrustRoot, TrustRootRole, TrustRootSigner
 use registry_platform_crypto::verify;
 use registry_platform_crypto::{did_jwk_from_public_jwk, sign, PrivateJwk};
 use registry_platform_ops::{
-    internal_config_hash, AntiRollbackKey, AntiRollbackRecord, FileAntiRollbackStore,
+    internal_config_hash, AntiRollbackKey, AntiRollbackRecord, BreakGlassRateLimit,
+    FileAntiRollbackStore, LocalOperatorApproval,
 };
 use registry_platform_testing::{
     fixtures, jwks_from_private_jwk, sign_ed25519_compact_jwt, sign_openid4vci_proof_jwt,
@@ -254,6 +255,22 @@ fn signed_tuf_apply_request(signed: &SignedConfigFixture) -> Value {
     })
 }
 
+fn signed_tuf_apply_request_with_local_approval(
+    signed: &SignedConfigFixture,
+    approval_reference: &str,
+) -> Value {
+    json!({
+        "local_approval_reference": approval_reference,
+        "tuf": {
+            "root_path": signed.root_path,
+            "metadata_dir": signed.metadata_dir,
+            "targets_dir": signed.targets_dir,
+            "datastore_dir": signed.datastore_dir,
+            "target_name": signed.target_name,
+        }
+    })
+}
+
 fn tough_fixture(name: &str) -> std::path::PathBuf {
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
@@ -289,12 +306,22 @@ fn add_config_trust(
     config: &mut StandaloneRegistryNotaryConfig,
     antirollback_path: std::path::PathBuf,
 ) {
+    let local_approval_path = antirollback_path.with_file_name("config-local-approvals.json");
+    add_config_trust_with_local_approval_path(config, antirollback_path, local_approval_path);
+}
+
+fn add_config_trust_with_local_approval_path(
+    config: &mut StandaloneRegistryNotaryConfig,
+    antirollback_path: std::path::PathBuf,
+    local_approval_path: std::path::PathBuf,
+) {
     let tuf_root_sha256 = sha256_uri(
         &fs::read(tough_fixture("simple-rsa").join("root.json"))
             .expect("trusted TUF root fixture reads"),
     );
     config.config_trust = Some(ConfigTrustConfig {
         antirollback_state_path: antirollback_path,
+        local_approval_state_path: local_approval_path,
         accepted_roots: vec![RegistryTrustRoot {
             root_id: "ops-root".to_string(),
             production: false,
@@ -327,10 +354,41 @@ fn add_config_trust(
                     "signing_key_cleanup".to_string(),
                     "signing_key_rotation".to_string(),
                     "emergency_break_glass".to_string(),
+                    "root_transition".to_string(),
                 ]),
             }],
         }],
     });
+}
+
+fn local_operator_approval(config_yaml: &str, previous_config_hash: &str) -> LocalOperatorApproval {
+    LocalOperatorApproval {
+        approved_by: "ops@example.test".to_string(),
+        reason: "approve Notary root transition".to_string(),
+        approval_reference: "ROOT-2026-Q2".to_string(),
+        change_class: "root_transition".to_string(),
+        config_hash: internal_config_hash(config_yaml.as_bytes()),
+        previous_config_hash: Some(previous_config_hash.to_string()),
+        expires_at_unix_seconds: Utc::now().timestamp() as u64 + 3600,
+        rate_limit_identity:
+            "registry-notary/registry-notary-standalone/development/notary-test-stream".to_string(),
+        rate_limit: BreakGlassRateLimit {
+            max_accepted: 1,
+            window_seconds: 3600,
+        },
+    }
+}
+
+fn write_local_approval_state(path: &std::path::Path, approval: LocalOperatorApproval) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("local approval parent dir");
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({ "approvals": [approval] }))
+            .expect("local approval state serializes"),
+    )
+    .expect("local approval state writes");
 }
 
 async fn write_signed_notary_config_tuf_fixture(
@@ -2844,6 +2902,283 @@ async fn admin_config_apply_signed_tuf_target_rejects_restart_required_without_m
     assert_eq!(posture["configuration"]["last_bundle_id"], Value::Null);
     assert_eq!(posture["configuration"]["last_apply_result"], Value::Null);
     assert!(posture["instance"].get("owner").is_none());
+}
+
+#[tokio::test]
+async fn admin_config_apply_signed_root_transition_swaps_governance_for_future_bundles() {
+    set_audit_secret();
+    std::env::set_var(
+        "TEST_EVIDENCE_API_KEY_HASH",
+        "sha256:a00cf33cd46d9ef96c1eff33df1c9cca20b1a02468cd78ec6a4b2887d1640b51",
+    );
+    std::env::set_var("TEST_EVIDENCE_SOURCE_TOKEN", "source-token");
+
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let local_approval_path = tmp.path().join("config-local-approvals.json");
+    let mut config = registry_data_api_config(
+        "http://127.0.0.1:1",
+        audit_path.to_str().expect("audit path is UTF-8"),
+    );
+    add_admin_api_key(&mut config);
+    add_ops_read_api_key(&mut config);
+    add_config_trust_with_local_approval_path(
+        &mut config,
+        antirollback_path.clone(),
+        local_approval_path.clone(),
+    );
+    let current_root = config
+        .config_trust
+        .as_mut()
+        .expect("config trust exists")
+        .accepted_roots
+        .first_mut()
+        .expect("current root exists");
+    current_root.roles[0].allowed_change_classes = BTreeSet::from(["root_transition".to_string()]);
+
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+    let mut candidate = config.clone();
+    let mut new_root = candidate
+        .config_trust
+        .as_ref()
+        .expect("candidate trust exists")
+        .accepted_roots[0]
+        .clone();
+    new_root.root_id = "ops-root-next".to_string();
+    new_root.roles[0].allowed_change_classes = BTreeSet::from(["public_metadata".to_string()]);
+    candidate
+        .config_trust
+        .as_mut()
+        .expect("candidate trust exists")
+        .accepted_roots
+        .push(new_root);
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    write_local_approval_state(
+        &local_approval_path,
+        local_operator_approval(&candidate_yaml, &current_config_hash),
+    );
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["root_transition"],
+    )
+    .await;
+
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let apply = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request_with_local_approval(
+            &signed,
+            "ROOT-2026-Q2",
+        ))
+        .await;
+
+    apply.assert_status_ok();
+    let body: Value = apply.json();
+    assert_eq!(body["result"], "applied");
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["restart_required"], false);
+
+    let record = config_audit_record(&audit_path, "/admin/v1/config/apply");
+    let config_audit = &record["config"];
+    assert_eq!(config_audit["change_classes"], json!(["root_transition"]));
+    assert_eq!(config_audit["local_approval_reference"], "ROOT-2026-Q2");
+    assert_eq!(
+        config_audit["local_approval_approved_by"],
+        "ops@example.test"
+    );
+    assert_eq!(
+        config_audit["local_approval_change_class"],
+        "root_transition"
+    );
+    assert!(config_audit["local_approval_reason_hash"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:")));
+    let audit_text = serde_json::to_string(&record).expect("audit record serializes");
+    assert!(!audit_text.contains("approve Notary root transition"));
+
+    let mut future_candidate = candidate.clone();
+    future_candidate.instance.owner = Some("Operations Ministry".to_string());
+    let future_yaml = serde_norway::to_string(&future_candidate).expect("future serializes");
+    let future_signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &internal_config_hash(candidate_yaml.as_bytes()),
+        &future_yaml,
+        3,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["public_metadata"],
+    )
+    .await;
+    let verify = server
+        .post("/admin/v1/config/verify")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&future_signed))
+        .await;
+    verify.assert_status_ok();
+    let verify_body: Value = verify.json();
+    assert_eq!(verify_body["result"], "verified");
+    assert_eq!(verify_body["restart_required"], true);
+
+    let posture = server
+        .get("/admin/v1/posture")
+        .add_header("x-api-key", "ops-token")
+        .await;
+    posture.assert_status_ok();
+    let posture: Value = posture.json();
+    assert_eq!(posture["configuration"]["last_apply_result"], "accepted");
+    assert!(posture["instance"].get("owner").is_none());
+}
+
+#[tokio::test]
+async fn admin_config_apply_signed_root_transition_missing_approval_rejects_before_state_swap() {
+    set_audit_secret();
+    std::env::set_var(
+        "TEST_EVIDENCE_API_KEY_HASH",
+        "sha256:a00cf33cd46d9ef96c1eff33df1c9cca20b1a02468cd78ec6a4b2887d1640b51",
+    );
+    std::env::set_var("TEST_EVIDENCE_SOURCE_TOKEN", "source-token");
+
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = registry_data_api_config(
+        "http://127.0.0.1:1",
+        audit_path.to_str().expect("audit path is UTF-8"),
+    );
+    add_admin_api_key(&mut config);
+    add_ops_read_api_key(&mut config);
+    add_config_trust(&mut config, antirollback_path.clone());
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+    let mut candidate = config.clone();
+    let mut new_root = candidate
+        .config_trust
+        .as_ref()
+        .expect("candidate trust exists")
+        .accepted_roots[0]
+        .clone();
+    new_root.root_id = "ops-root-next".to_string();
+    candidate
+        .config_trust
+        .as_mut()
+        .expect("candidate trust exists")
+        .accepted_roots
+        .push(new_root);
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["root_transition"],
+    )
+    .await;
+
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(body["result"], "rejected_local_approval");
+    assert_eq!(body["applied"], false);
+    assert_eq!(body["restart_required"], false);
+
+    let antirollback = FileAntiRollbackStore::new(&antirollback_path)
+        .load(&AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "registry-notary-standalone".to_string(),
+            environment: "development".to_string(),
+            stream_id: "notary-test-stream".to_string(),
+        })
+        .expect("antirollback state still loads");
+    assert_eq!(antirollback.last_sequence, 1);
+    assert_eq!(antirollback.last_config_hash, current_config_hash);
+
+    let posture = server
+        .get("/admin/v1/posture")
+        .add_header("x-api-key", "ops-token")
+        .await;
+    posture.assert_status_ok();
+    let posture: Value = posture.json();
+    assert_eq!(posture["configuration"]["last_apply_result"], Value::Null);
+}
+
+#[tokio::test]
+async fn admin_config_apply_signed_root_transition_without_change_class_is_restart_required() {
+    set_audit_secret();
+    std::env::set_var(
+        "TEST_EVIDENCE_API_KEY_HASH",
+        "sha256:a00cf33cd46d9ef96c1eff33df1c9cca20b1a02468cd78ec6a4b2887d1640b51",
+    );
+    std::env::set_var("TEST_EVIDENCE_SOURCE_TOKEN", "source-token");
+
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = registry_data_api_config(
+        "http://127.0.0.1:1",
+        audit_path.to_str().expect("audit path is UTF-8"),
+    );
+    add_admin_api_key(&mut config);
+    add_config_trust(&mut config, antirollback_path.clone());
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+    let mut candidate = config.clone();
+    let mut new_root = candidate
+        .config_trust
+        .as_ref()
+        .expect("candidate trust exists")
+        .accepted_roots[0]
+        .clone();
+    new_root.root_id = "ops-root-next".to_string();
+    candidate
+        .config_trust
+        .as_mut()
+        .expect("candidate trust exists")
+        .accepted_roots
+        .push(new_root);
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["public_metadata"],
+    )
+    .await;
+
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(body["result"], "rejected_restart_required");
+    assert_eq!(body["restart_required"], true);
 }
 
 #[tokio::test]

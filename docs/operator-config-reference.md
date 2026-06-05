@@ -95,6 +95,7 @@ into the repository.
 ```yaml
 config_trust:
   antirollback_state_path: /var/lib/registry-notary/config-antirollback.json
+  local_approval_state_path: /var/lib/registry-notary/config-local-approvals.json
   accepted_roots:
     - root_id: ops-root
       production: false
@@ -109,22 +110,27 @@ config_trust:
         - name: config-admin
           threshold: 1
           signer_kids: [TUF_TARGETS_ROLE_KEY_ID_A]
-          allowed_change_classes: [public_metadata]
+          allowed_change_classes: [public_metadata, root_transition]
 ```
 
 `config_trust` is optional. Simple local deployments omit it and keep using the
 local YAML loaded at startup. Governed config apply requires
-`antirollback_state_path`, which must point to durable local state such as a
-mounted volume. `accepted_roots` uses the shared Registry trust-root shape.
+`antirollback_state_path` and `local_approval_state_path`, which must point to
+durable local state such as a mounted volume. `accepted_roots` uses the shared
+Registry trust-root shape.
 Standalone Registry Notary verifies local signed TUF config targets against
 `accepted_roots` when the admin request provides a `tuf` source. Verified TUF
 targets-role signature key IDs, not target-declared custom metadata, satisfy the
 role threshold. Inline YAML remains available for verify/dry-run diagnostics.
-For TUF root rotation, add the new final `tuf_root_sha256` as another local
-`accepted_roots` entry before applying bundles that verify through the rotated
-root. `valid_from_unix_seconds` and `valid_until_unix_seconds` are optional
-local bounds for overlap windows; expired or not-yet-valid roots fail
-authorization even when TUF verification and signer quorum otherwise succeed.
+For TUF root transition, apply a signed local TUF bundle whose target metadata
+includes `root_transition`, changes only `config_trust.accepted_roots`, keeps
+the antirollback and local approval paths unchanged, retains existing roots
+unchanged, and references a matching unexpired local approval. Add the new
+final `tuf_root_sha256` as another local `accepted_roots` entry before applying
+bundles that verify through the rotated root. `valid_from_unix_seconds` and
+`valid_until_unix_seconds` are optional local bounds for overlap windows;
+expired or not-yet-valid roots fail authorization even when TUF verification
+and signer quorum otherwise succeed.
 `POST /admin/v1/config/apply` can hot-apply governed signed signing-key
 rotations for credential issuer, pre-authorized access-token, eSignet
 client-assertion, and federation response signing paths after TUF verification,

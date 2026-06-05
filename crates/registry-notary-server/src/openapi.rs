@@ -2480,6 +2480,10 @@ fn config_apply_request_schema() -> Value {
             "break_glass_rate_limit": {
                 "$ref": "#/components/schemas/BreakGlassRateLimit"
             },
+            "local_approval_reference": {
+                "type": "string",
+                "description": "Apply-only reference for a matching local approval record used by root_transition bundles."
+            },
             "tuf": {
                 "$ref": "#/components/schemas/LocalTufConfigTargetRequest"
             }
@@ -3120,6 +3124,7 @@ mod tests {
             request_schema["break_glass_rate_limit"]["$ref"],
             json!("#/components/schemas/BreakGlassRateLimit")
         );
+        assert_eq!(request_schema["local_approval_reference"]["type"], "string");
         assert_eq!(
             doc["components"]["schemas"]["BreakGlassApproval"]["properties"]
                 ["emergency_change_class"]["description"],
