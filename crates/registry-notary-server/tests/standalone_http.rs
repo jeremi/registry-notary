@@ -9267,6 +9267,7 @@ async fn admin_config_apply_signed_preauth_signing_rotation_preserves_inflight_t
         .client_signing_key_id = "esignet-rp-key-2".to_string();
 
     let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let candidate_config_hash = internal_config_hash(candidate_yaml.as_bytes());
     let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
         &tmp,
         &current_config_hash,
@@ -9287,15 +9288,95 @@ async fn admin_config_apply_signed_preauth_signing_rotation_preserves_inflight_t
         "exp": OffsetDateTime::now_utc().unix_timestamp() + 300,
         "nbf": OffsetDateTime::now_utc().unix_timestamp(),
     }));
+    let authorization = format!("Bearer {admin_token}");
     let response = server
         .post("/admin/v1/config/apply")
-        .add_header("authorization", format!("Bearer {admin_token}"))
+        .add_header("authorization", authorization.clone())
         .json(&signed_tuf_apply_request(&signed))
         .await;
     response.assert_status_ok();
     let body: Value = response.json();
     assert_eq!(body["result"], "applied");
+    assert_eq!(body["posture_result"], "accepted");
+    assert_eq!(body["applied"], true);
     assert_eq!(body["restart_required"], false);
+
+    let record = config_audit_record(&audit_path, "/admin/v1/config/apply");
+    let config_audit = &record["config"];
+    assert_eq!(config_audit["action"], "apply");
+    assert_eq!(config_audit["source"], "signed_bundle_file");
+    assert_eq!(config_audit["bundle_id"], "notary-test-bundle");
+    assert_eq!(config_audit["bundle_sequence"], 2);
+    assert_eq!(config_audit["signer_kids"], json!([TUF_TARGETS_SIGNER_KID]));
+    assert_eq!(
+        config_audit["change_classes"],
+        json!(["signing_key_rotation"])
+    );
+    assert_eq!(config_audit["previous_config_hash"], current_config_hash);
+    assert_eq!(config_audit["config_hash"], candidate_config_hash);
+    assert_eq!(config_audit["product_validation_result"], "accepted");
+    assert_eq!(config_audit["apply_result"], "applied");
+    assert_eq!(config_audit["posture_result"], "accepted");
+    assert_eq!(config_audit["applied"], true);
+    assert_eq!(config_audit["restart_required"], false);
+
+    let antirollback = FileAntiRollbackStore::new(&antirollback_path)
+        .load(&AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "registry-notary-standalone".to_string(),
+            environment: "development".to_string(),
+            stream_id: "notary-test-stream".to_string(),
+        })
+        .expect("antirollback state loads after apply");
+    assert_eq!(antirollback.last_sequence, 2);
+    assert_eq!(antirollback.last_config_hash, candidate_config_hash);
+
+    let posture = server
+        .get("/admin/v1/posture?tier=restricted")
+        .add_header("authorization", authorization.clone())
+        .await;
+    posture.assert_status_ok();
+    let posture: Value = posture.json();
+    assert_eq!(posture["configuration"]["source"], "signed_bundle_file");
+    assert_eq!(
+        posture["configuration"]["last_bundle_id"],
+        "notary-test-bundle"
+    );
+    assert_eq!(posture["configuration"]["last_bundle_sequence"], 2);
+    assert_eq!(posture["configuration"]["last_apply_result"], "accepted");
+    assert_eq!(posture["configuration"]["restart_required"], false);
+    let active_signing_keys = posture["notary"]["signing_keys"]["active"]
+        .as_array()
+        .expect("active signing keys are listed")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(active_signing_keys.contains("access-token-key-2"));
+    assert!(active_signing_keys.contains("esignet-rp-key-2"));
+    let publish_only_signing_keys = posture["notary"]["signing_keys"]["publish_only"]
+        .as_array()
+        .expect("publish-only signing keys are listed")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(publish_only_signing_keys.contains("access-token-key"));
+    assert!(publish_only_signing_keys.contains("esignet-rp-key"));
+    assert_eq!(
+        posture["notary"]["signing_keys"]["readiness"]["did:web:issuer.example#access-token-key-2"],
+        "ready"
+    );
+    assert_eq!(
+        posture["notary"]["signing_keys"]["readiness"]["did:web:rp.example#esignet-rp-key-2"],
+        "ready"
+    );
+    assert_eq!(
+        posture["notary"]["signing_keys"]["readiness"]["did:web:issuer.example#access-token-key"],
+        "ready"
+    );
+    assert_eq!(
+        posture["notary"]["signing_keys"]["readiness"]["did:web:rp.example#esignet-rp-key"],
+        "ready"
+    );
 
     let old_access_auth = server
         .get("/.well-known/evidence/jwks.json")
