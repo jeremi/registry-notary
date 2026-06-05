@@ -14,8 +14,10 @@ validation time.
 
 - `active` keys can sign new credentials and are published in
   `/.well-known/evidence/jwks.json`.
-- `publish_only` keys are published in JWKS but cannot be used by a credential
-  profile. Use them for old verification keys during rotation.
+- `publish_only` keys are published in JWKS while
+  `publish_until_unix_seconds` is absent or still in the future, but cannot be
+  used by a credential profile. Use them for old verification keys during
+  rotation.
 - `disabled` keys are ignored by issuance and JWKS publication.
 - Published `kid` values must be unique across active and publish-only keys.
 - Credential profile issuers must match the signing key `kid` DID when the key
@@ -90,9 +92,13 @@ evidence:
       alg: EdDSA
       kid: did:web:issuer.example#issuer-2025
       status: publish_only
+      publish_until_unix_seconds: 1772592000
 ```
 
-Publish-only keys cannot be referenced by `credential_profiles.*.signing_key`.
+`publish_until_unix_seconds` is optional metadata and valid only for
+`publish_only` keys. Expired publish-only keys are omitted from JWKS and from
+restricted posture `notary.signing_keys.publish_only`. Publish-only keys cannot
+be referenced by `credential_profiles.*.signing_key`.
 
 ## Federation Response Signing
 
@@ -124,8 +130,8 @@ public key id.
 1. Add the new key as `active` with a new `kid`.
 2. Move credential profiles to the new `signing_key`.
 3. Move the old key to `publish_only` and configure only `public_jwk_env`.
-4. Keep the old public key published until every credential signed by it has
-   expired and any verifier cache lifetime has elapsed.
+4. Set `publish_until_unix_seconds` to the end of the verifier window, or omit
+   it for an indefinite manual window.
 5. Change the old key to `disabled` and remove its secret material.
 
 Do not reuse a `kid` for new key material. Verifiers cache keys by `kid`, and
@@ -144,7 +150,7 @@ stateDiagram-v2
   end note
   note right of publish_only
     Cannot sign,
-    published in JWKS for verification
+    published until window expires
   end note
   note right of disabled
     Ignored by issuance and JWKS
@@ -236,6 +242,7 @@ evidence:
       alg: EdDSA
       kid: did:web:issuer.example#issuer-hsm-2025
       status: publish_only
+      publish_until_unix_seconds: 1772592000
 ```
 
 ## Disabled Keys

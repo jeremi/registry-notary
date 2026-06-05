@@ -6,12 +6,13 @@ use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OnceCell, Semaphore};
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -41,7 +42,7 @@ use registry_platform_authcommon::{
     parse_bearer_token, parse_fingerprint, verify_api_key, FingerprintFormatError,
 };
 use registry_platform_crypto::{
-    sign, verify, LocalJwkSigner, PrivateJwk, PublicJwk, SigningProvider,
+    sign, verify, KeyReadiness, LocalJwkSigner, PrivateJwk, PublicJwk, SigningProvider,
 };
 use registry_platform_httputil::{
     read_bounded, url as httputil_url, FetchUrlError, FetchUrlPolicy, ValidatedFetchUrl,
@@ -62,7 +63,7 @@ use crate::cel_worker::{CelWorker, CelWorkerConfig};
 #[cfg(feature = "registry-notary-cel")]
 use crate::runtime::validate_cel_claims_for_startup;
 use crate::{
-    api::ADMIN_SCOPE,
+    api::{ConfigGovernanceContext, ADMIN_SCOPE},
     credential_status::{CredentialStatusBuildError, CredentialStatusStore},
     metrics::{metrics_handler, metrics_middleware, AppMetrics},
     posture::PostureContext,
@@ -102,7 +103,35 @@ pub(crate) fn current_request_correlation_id() -> Option<BoundedCorrelationId> {
 pub fn standalone_router(
     config: StandaloneRegistryNotaryConfig,
 ) -> Result<Router, StandaloneServerError> {
+    Ok(notary_router_from_runtime(compile_notary_runtime(config)?))
+}
+
+pub(crate) fn credential_issuer_runtime_from_config(
+    config: &EvidenceConfig,
+) -> Result<(Arc<dyn crate::api::EvidenceIssuerResolver>, SignerReadiness), StandaloneServerError> {
+    let signing_keys = SigningKeyRegistry::from_config(config)?;
+    let signer_readiness = signing_keys.signer_readiness();
+    let issuers = Arc::new(EvidenceIssuerRegistry::from_signing_keys(
+        config,
+        &signing_keys,
+    )?);
+    Ok((issuers, signer_readiness))
+}
+
+pub struct NotaryRuntimeSnapshot {
+    metrics: Arc<AppMetrics>,
+    auth_state: Arc<AuthAuditState>,
+    api_state: Arc<RegistryNotaryApiState>,
+    cors_policy: registry_platform_httpsec::CorsPolicy,
+    wallet_cors_policy: SelfAttestationWalletCorsPolicy,
+    federation_enabled: bool,
+}
+
+pub fn compile_notary_runtime(
+    config: StandaloneRegistryNotaryConfig,
+) -> Result<NotaryRuntimeSnapshot, StandaloneServerError> {
     config.validate()?;
+    let federation_enabled = config.federation.enabled;
     let evidence = Arc::new(config.evidence.clone());
     let self_attestation = Arc::new(config.self_attestation.clone());
     let oid4vci = Arc::new(config.oid4vci.clone());
@@ -175,14 +204,35 @@ pub fn standalone_router(
     )?
     .with_preauth_runtime(preauth_runtime)
     .with_signer_readiness(signer_readiness)
-    .with_posture_context(posture_context);
+    .with_posture_context(posture_context)
+    .with_config_governance(ConfigGovernanceContext::from_config(&config))
+    .with_runtime_config(Arc::new(config.clone()));
     #[cfg(feature = "registry-notary-cel")]
     let api_state = api_state
         .with_cel_worker(cel_worker)
         .with_cel_config(Arc::new(config.cel.clone()));
     let api_state = Arc::new(api_state);
+    Ok(NotaryRuntimeSnapshot {
+        metrics,
+        auth_state,
+        api_state,
+        cors_policy,
+        wallet_cors_policy,
+        federation_enabled,
+    })
+}
+
+pub fn notary_router_from_runtime(snapshot: NotaryRuntimeSnapshot) -> Router {
+    let NotaryRuntimeSnapshot {
+        metrics,
+        auth_state,
+        api_state,
+        cors_policy,
+        wallet_cors_policy,
+        federation_enabled,
+    } = snapshot;
     let mut routes = router();
-    if config.federation.enabled {
+    if federation_enabled {
         routes = routes.merge(crate::api::federation_router());
     }
     routes = routes.route(
@@ -190,7 +240,7 @@ pub fn standalone_router(
         get(admin_metrics_handler).with_state(Arc::clone(&metrics)),
     );
 
-    Ok(routes
+    routes
         .layer(from_fn_with_state(Arc::clone(&metrics), metrics_middleware))
         .layer(axum::Extension(Arc::clone(&api_state)))
         .layer(from_fn_with_state(auth_state, auth_audit_middleware))
@@ -210,7 +260,7 @@ pub fn standalone_router(
         .layer(registry_platform_httpsec::request_body_limit(
             MAX_INBOUND_REQUEST_BODY_BYTES,
         ))
-        .layer(axum::middleware::from_fn(rewrite_payload_too_large_problem)))
+        .layer(axum::middleware::from_fn(rewrite_payload_too_large_problem))
 }
 
 #[derive(Debug, Clone)]
@@ -1123,10 +1173,23 @@ fn bulk_timeout(connection: &ResolvedEvidenceSourceConnection, batch_size: usize
     scaled.min(connection.bulk_timeout_max)
 }
 
+#[derive(Debug, Clone)]
+struct PublishedJwk {
+    public_jwk: Value,
+    publish_until_unix_seconds: Option<u64>,
+}
+
+impl PublishedJwk {
+    fn is_published_at(&self, now_unix_seconds: u64) -> bool {
+        self.publish_until_unix_seconds
+            .is_none_or(|publish_until| now_unix_seconds <= publish_until)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EvidenceIssuerRegistry {
     issuers: BTreeMap<String, EvidenceIssuer>,
-    public_jwks: Vec<Value>,
+    public_jwks: Vec<PublishedJwk>,
 }
 
 impl EvidenceIssuerRegistry {
@@ -1167,30 +1230,111 @@ impl EvidenceIssuerResolver for EvidenceIssuerRegistry {
     }
 
     fn public_jwks(&self, _evidence: &EvidenceConfig) -> Result<Vec<Value>, EvidenceError> {
-        Ok(self.public_jwks.clone())
+        Ok(published_jwks_at(
+            &self.public_jwks,
+            current_unix_timestamp_seconds(),
+        ))
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SignerReadiness {
-    providers: Arc<Vec<Arc<AtomicBool>>>,
+    entries: Arc<Vec<SignerReadinessEntry>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SignerReadinessSnapshot {
+    pub(crate) kid: String,
+    pub(crate) readiness: KeyReadiness,
+}
+
+#[derive(Debug, Clone)]
+struct SignerReadinessEntry {
+    kid: String,
+    required_for_signing: bool,
+    state: SignerReadinessState,
+}
+
+#[derive(Debug, Clone)]
+enum SignerReadinessState {
+    Static(KeyReadiness),
+    #[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+    Flag(Arc<AtomicBool>),
+    Watched(Arc<AtomicU8>),
+}
+
+impl SignerReadinessEntry {
+    fn readiness(&self) -> KeyReadiness {
+        match &self.state {
+            SignerReadinessState::Static(readiness) => *readiness,
+            SignerReadinessState::Flag(flag) if flag.load(Ordering::SeqCst) => KeyReadiness::Ready,
+            SignerReadinessState::Flag(_) => KeyReadiness::NotReady,
+            SignerReadinessState::Watched(state) => {
+                key_readiness_from_u8(state.load(Ordering::SeqCst))
+            }
+        }
+    }
+}
+
+const KEY_READINESS_READY: u8 = 0;
+const KEY_READINESS_DEGRADED: u8 = 1;
+const KEY_READINESS_NOT_READY: u8 = 2;
+const KEY_READINESS_UNKNOWN: u8 = 3;
+
+fn key_readiness_to_u8(readiness: KeyReadiness) -> u8 {
+    match readiness {
+        KeyReadiness::Ready => KEY_READINESS_READY,
+        KeyReadiness::Degraded => KEY_READINESS_DEGRADED,
+        KeyReadiness::NotReady => KEY_READINESS_NOT_READY,
+        KeyReadiness::Unknown => KEY_READINESS_UNKNOWN,
+        _ => KEY_READINESS_UNKNOWN,
+    }
+}
+
+fn key_readiness_from_u8(value: u8) -> KeyReadiness {
+    match value {
+        KEY_READINESS_READY => KeyReadiness::Ready,
+        KEY_READINESS_DEGRADED => KeyReadiness::Degraded,
+        KEY_READINESS_NOT_READY => KeyReadiness::NotReady,
+        _ => KeyReadiness::Unknown,
+    }
 }
 
 impl SignerReadiness {
+    #[allow(dead_code)]
     pub(crate) fn from_provider_flags(providers: Vec<Arc<AtomicBool>>) -> Self {
         Self {
-            providers: Arc::new(providers),
+            entries: Arc::new(
+                providers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, flag)| SignerReadinessEntry {
+                        kid: format!("provider-{}", index + 1),
+                        required_for_signing: true,
+                        state: SignerReadinessState::Flag(flag),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn from_entries(entries: Vec<SignerReadinessEntry>) -> Self {
+        Self {
+            entries: Arc::new(entries),
         }
     }
 
     pub(crate) fn total(&self) -> usize {
-        self.providers.len()
+        self.entries
+            .iter()
+            .filter(|entry| entry.required_for_signing)
+            .count()
     }
 
     pub(crate) fn ready_count(&self) -> usize {
-        self.providers
+        self.entries
             .iter()
-            .filter(|provider| provider.load(Ordering::SeqCst))
+            .filter(|entry| entry.required_for_signing && entry.readiness().is_ready())
             .count()
     }
 
@@ -1201,14 +1345,24 @@ impl SignerReadiness {
     pub(crate) fn is_ready(&self) -> bool {
         self.failed_count() == 0
     }
+
+    pub(crate) fn by_kid(&self) -> Vec<SignerReadinessSnapshot> {
+        self.entries
+            .iter()
+            .map(|entry| SignerReadinessSnapshot {
+                kid: entry.kid.clone(),
+                readiness: entry.readiness(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Default)]
 struct SigningKeyRegistry {
     issuers: BTreeMap<String, EvidenceIssuer>,
     providers: BTreeMap<String, Arc<dyn SigningProvider>>,
-    public_jwks: Vec<Value>,
-    readiness_flags: Vec<Arc<AtomicBool>>,
+    public_jwks: Vec<PublishedJwk>,
+    readiness_entries: Vec<SignerReadinessEntry>,
 }
 
 impl SigningKeyRegistry {
@@ -1217,7 +1371,7 @@ impl SigningKeyRegistry {
         let mut providers = BTreeMap::new();
         let mut public_jwks_by_kid = BTreeMap::new();
         #[cfg_attr(not(feature = "pkcs11"), allow(unused_mut))]
-        let mut readiness_flags = Vec::new();
+        let mut readiness_entries = Vec::new();
         for (key_id, key) in &config.signing_keys {
             if !key.status.may_publish() {
                 continue;
@@ -1234,8 +1388,18 @@ impl SigningKeyRegistry {
                         let public_jwk = issuer.public_jwk();
                         issuers.insert(key_id.clone(), issuer);
                         providers.insert(key_id.clone(), provider);
+                        readiness_entries.push(static_key_readiness(
+                            key.kid.clone(),
+                            true,
+                            KeyReadiness::Ready,
+                        ));
                         public_jwk
                     } else {
+                        readiness_entries.push(static_key_readiness(
+                            key.kid.clone(),
+                            false,
+                            KeyReadiness::Ready,
+                        ));
                         build_public_jwk_value(key_id, key)?
                     }
                 }
@@ -1244,7 +1408,11 @@ impl SigningKeyRegistry {
                         #[cfg(feature = "pkcs11")]
                         {
                             let provider = pkcs11::Pkcs11SigningProvider::from_config(key_id, key)?;
-                            readiness_flags.push(provider.readiness_flag());
+                            readiness_entries.push(flag_key_readiness(
+                                key.kid.clone(),
+                                true,
+                                provider.readiness_flag(),
+                            ));
                             let provider: Arc<dyn SigningProvider> = Arc::new(provider);
                             let issuer =
                                 EvidenceIssuer::from_signing_provider(Arc::clone(&provider))
@@ -1266,7 +1434,33 @@ impl SigningKeyRegistry {
                             });
                         }
                     } else {
+                        readiness_entries.push(static_key_readiness(
+                            key.kid.clone(),
+                            false,
+                            KeyReadiness::Ready,
+                        ));
                         build_public_jwk_value(key_id, key)?
+                    }
+                }
+                SigningKeyProviderConfig::FileWatch => {
+                    if key.status.may_sign() {
+                        let provider = FileWatchSigningProvider::from_config(key_id, key)?;
+                        readiness_entries.push(watched_key_readiness(
+                            key.kid.clone(),
+                            true,
+                            provider.readiness_state(),
+                        ));
+                        let provider: Arc<dyn SigningProvider> = Arc::new(provider);
+                        let issuer = EvidenceIssuer::from_signing_provider(Arc::clone(&provider))
+                            .map_err(|_| {
+                            invalid_signing_key(key_id, "file-watch signer failed self-test")
+                        })?;
+                        let public_jwk = issuer.public_jwk();
+                        issuers.insert(key_id.clone(), issuer);
+                        providers.insert(key_id.clone(), provider);
+                        public_jwk
+                    } else {
+                        continue;
                     }
                 }
                 SigningKeyProviderConfig::LocalPkcs12File => {
@@ -1274,14 +1468,25 @@ impl SigningKeyRegistry {
                         provider: "local_pkcs12_file".to_string(),
                     });
                 }
+                _ => {
+                    return Err(StandaloneServerError::SigningKeyProviderUnavailable {
+                        provider: "unsupported".to_string(),
+                    });
+                }
             };
-            public_jwks_by_kid.insert(key.kid.clone(), public_jwk);
+            public_jwks_by_kid.insert(
+                key.kid.clone(),
+                PublishedJwk {
+                    public_jwk,
+                    publish_until_unix_seconds: key.publish_until_unix_seconds,
+                },
+            );
         }
         Ok(Self {
             issuers,
             providers,
             public_jwks: public_jwks_by_kid.into_values().collect(),
-            readiness_flags,
+            readiness_entries,
         })
     }
 
@@ -1289,7 +1494,7 @@ impl SigningKeyRegistry {
         self.issuers.get(key_id)
     }
 
-    fn public_jwks(&self) -> Vec<Value> {
+    fn public_jwks(&self) -> Vec<PublishedJwk> {
         self.public_jwks.clone()
     }
 
@@ -1307,7 +1512,105 @@ impl SigningKeyRegistry {
     }
 
     fn signer_readiness(&self) -> SignerReadiness {
-        SignerReadiness::from_provider_flags(self.readiness_flags.clone())
+        SignerReadiness::from_entries(self.readiness_entries.clone())
+    }
+}
+
+pub(crate) fn signing_key_public_jwk_from_config(
+    config: &EvidenceConfig,
+    key_id: &str,
+) -> Result<Option<PublicJwk>, StandaloneServerError> {
+    let Some(key) = config.signing_keys.get(key_id) else {
+        return Ok(None);
+    };
+    if !key.status.may_publish() {
+        return Ok(None);
+    }
+    if key.status.may_sign() {
+        return match key.provider {
+            SigningKeyProviderConfig::LocalJwkEnv => {
+                Ok(Some(build_local_jwk_signer(key_id, key)?.public_jwk()))
+            }
+            SigningKeyProviderConfig::FileWatch => Ok(Some(
+                load_file_watch_jwk_signer(key_id, key, std::path::Path::new(&key.path))?
+                    .public_jwk(),
+            )),
+            SigningKeyProviderConfig::Pkcs11 => {
+                #[cfg(feature = "pkcs11")]
+                {
+                    Ok(Some(
+                        pkcs11::Pkcs11SigningProvider::from_config(key_id, key)?.public_jwk(),
+                    ))
+                }
+                #[cfg(not(feature = "pkcs11"))]
+                {
+                    Err(StandaloneServerError::SigningKeyProviderUnavailable {
+                        provider: "pkcs11".to_string(),
+                    })
+                }
+            }
+            SigningKeyProviderConfig::LocalPkcs12File => {
+                Err(StandaloneServerError::SigningKeyProviderUnavailable {
+                    provider: "local_pkcs12_file".to_string(),
+                })
+            }
+            _ => Err(StandaloneServerError::SigningKeyProviderUnavailable {
+                provider: "unsupported".to_string(),
+            }),
+        };
+    }
+    let value = build_public_jwk_value(key_id, key)?;
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|_| invalid_signing_key(key_id, "public JWK could not be deserialized"))
+}
+
+fn published_jwks_at(public_jwks: &[PublishedJwk], now_unix_seconds: u64) -> Vec<Value> {
+    public_jwks
+        .iter()
+        .filter(|entry| entry.is_published_at(now_unix_seconds))
+        .map(|entry| entry.public_jwk.clone())
+        .collect()
+}
+
+fn current_unix_timestamp_seconds() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0)
+}
+
+fn static_key_readiness(
+    kid: String,
+    required_for_signing: bool,
+    readiness: KeyReadiness,
+) -> SignerReadinessEntry {
+    SignerReadinessEntry {
+        kid,
+        required_for_signing,
+        state: SignerReadinessState::Static(readiness),
+    }
+}
+
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+fn flag_key_readiness(
+    kid: String,
+    required_for_signing: bool,
+    flag: Arc<AtomicBool>,
+) -> SignerReadinessEntry {
+    SignerReadinessEntry {
+        kid,
+        required_for_signing,
+        state: SignerReadinessState::Flag(flag),
+    }
+}
+
+fn watched_key_readiness(
+    kid: String,
+    required_for_signing: bool,
+    state: Arc<AtomicU8>,
+) -> SignerReadinessEntry {
+    SignerReadinessEntry {
+        kid,
+        required_for_signing,
+        state: SignerReadinessState::Watched(state),
     }
 }
 
@@ -1321,10 +1624,19 @@ fn build_local_jwk_signer(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid_signing_key(key_id, "private_jwk_env is missing or empty"))?,
     );
-    let mut jwk = PrivateJwk::parse(raw.as_str()).map_err(|_| {
+    build_private_jwk_signer_from_raw(key_id, key, raw.as_str(), "private_jwk_env")
+}
+
+fn build_private_jwk_signer_from_raw(
+    key_id: &str,
+    key: &SigningKeyConfig,
+    raw: &str,
+    source: &str,
+) -> Result<LocalJwkSigner, StandaloneServerError> {
+    let mut jwk = PrivateJwk::parse(raw).map_err(|_| {
         invalid_signing_key(
             key_id,
-            "private_jwk_env does not contain a valid private JWK",
+            &format!("{source} does not contain a valid private JWK"),
         )
     })?;
     if jwk.kid.as_deref().is_some_and(|kid| kid != key.kid) {
@@ -1348,6 +1660,112 @@ fn build_local_jwk_signer(
         .map_err(|_| invalid_signing_key(key_id, "local signer self-test verification failed"))?;
     LocalJwkSigner::new(jwk)
         .map_err(|_| invalid_signing_key(key_id, "local signer could not be constructed"))
+}
+
+#[derive(Clone)]
+struct FileWatchSigningProvider {
+    config_key_id: String,
+    key_config: SigningKeyConfig,
+    path: std::path::PathBuf,
+    expected_public_jwk: PublicJwk,
+    signer: Arc<StdMutex<LocalJwkSigner>>,
+    readiness: Arc<AtomicU8>,
+    algorithm: registry_platform_crypto::SigningAlgorithm,
+}
+
+impl FileWatchSigningProvider {
+    fn from_config(key_id: &str, key: &SigningKeyConfig) -> Result<Self, StandaloneServerError> {
+        let path = std::path::PathBuf::from(&key.path);
+        let signer = load_file_watch_jwk_signer(key_id, key, &path)?;
+        Ok(Self {
+            config_key_id: key_id.to_string(),
+            key_config: key.clone(),
+            path,
+            expected_public_jwk: signer.public_jwk(),
+            algorithm: signer.algorithm(),
+            signer: Arc::new(StdMutex::new(signer)),
+            readiness: Arc::new(AtomicU8::new(key_readiness_to_u8(KeyReadiness::Ready))),
+        })
+    }
+
+    fn readiness(&self) -> KeyReadiness {
+        key_readiness_from_u8(self.readiness.load(Ordering::SeqCst))
+    }
+
+    fn readiness_state(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.readiness)
+    }
+
+    fn current_signer(&self) -> LocalJwkSigner {
+        self.refresh();
+        self.signer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn refresh(&self) {
+        match load_file_watch_jwk_signer(&self.config_key_id, &self.key_config, &self.path) {
+            Ok(signer) if signer.public_jwk() == self.expected_public_jwk => {
+                *self
+                    .signer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = signer;
+                self.readiness
+                    .store(key_readiness_to_u8(KeyReadiness::Ready), Ordering::SeqCst);
+            }
+            Ok(_) | Err(_) => {
+                self.readiness.store(
+                    key_readiness_to_u8(KeyReadiness::Degraded),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for FileWatchSigningProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileWatchSigningProvider")
+            .field("kid", &self.key_config.kid)
+            .field("alg", &self.algorithm)
+            .field("readiness", &self.readiness())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl SigningProvider for FileWatchSigningProvider {
+    fn algorithm(&self) -> registry_platform_crypto::SigningAlgorithm {
+        self.algorithm
+    }
+
+    fn key_id(&self) -> &str {
+        &self.key_config.kid
+    }
+
+    fn public_jwk(&self) -> PublicJwk {
+        self.current_signer().public_jwk()
+    }
+
+    async fn sign(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, registry_platform_crypto::SigningError> {
+        self.current_signer().sign(payload).await
+    }
+}
+
+fn load_file_watch_jwk_signer(
+    key_id: &str,
+    key: &SigningKeyConfig,
+    path: &std::path::Path,
+) -> Result<LocalJwkSigner, StandaloneServerError> {
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|_| invalid_signing_key(key_id, "file_watch key file could not be read"))?,
+    );
+    build_private_jwk_signer_from_raw(key_id, key, raw.as_str(), "file_watch key file")
 }
 
 fn build_public_jwk_value(
@@ -2086,6 +2504,7 @@ pub(crate) fn pre_auth_audit_event(
         matching_outcome: None,
         matching_error_code: None,
         batch_items: None,
+        config: None,
     }
 }
 
@@ -2989,6 +3408,7 @@ async fn auth_audit_middleware(
             matching_outcome: None,
             matching_error_code: None,
             batch_items: None,
+            ..EvidenceAuditContext::default()
         });
         let audit_event = build_audit_event(
             None,
@@ -3038,6 +3458,7 @@ async fn auth_audit_middleware(
                     matching_outcome: None,
                     matching_error_code: None,
                     batch_items: None,
+                    ..EvidenceAuditContext::default()
                 });
                 let audit_event = build_audit_event(
                     None,
@@ -3212,6 +3633,7 @@ fn build_audit_event(
     let matching_outcome = audit.and_then(|context| context.matching_outcome.clone());
     let matching_error_code = audit.and_then(|context| context.matching_error_code.clone());
     let batch_items = audit.and_then(|context| context.batch_items.clone());
+    let config = audit.and_then(|context| context.config.clone());
     let error_code = error.map(|context| context.0.clone());
     let decision = audit
         .and_then(|context| context.verification_decision.clone())
@@ -3268,6 +3690,7 @@ fn build_audit_event(
         matching_outcome,
         matching_error_code,
         batch_items,
+        config,
     }
 }
 
@@ -5364,10 +5787,202 @@ mod tests {
     const OPENFN_SPIKE_PURPOSE: &str = "https://purpose.example.test/eligibility";
     const TEST_AUDIT_HASH_SECRET_ENV: &str = "REGISTRY_NOTARY_TEST_AUDIT_HASH_SECRET";
     const TEST_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"#;
+    const TEST_ISSUER_JWK_WITH_KID: &str = r##"{"kty":"OKP","crv":"Ed25519","kid":"did:web:issuer.example#file-watch","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"##;
+    const TEST_ROTATED_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"8jFBgUJxaaQimd4NjzxhvPYyNbcOnnZsqOntZbpP3Xk","x":"XvW-aWwJCWSYoYudTB9OZqNHURKElnnyGNa6DQNjzZk","alg":"EdDSA"}"#;
     const TEST_OLD_ISSUER_PUBLIC_JWK: &str = r##"{"kty":"OKP","crv":"Ed25519","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA","kid":"did:web:issuer.example#old"}"##;
     const TEST_OLD_HSM_PUBLIC_JWK: &str = r##"{"kty":"OKP","crv":"Ed25519","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA","kid":"did:web:issuer.example#hsm-old"}"##;
     #[cfg(feature = "pkcs11")]
     static SOFTHSM_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn signer_readiness_tracks_status_by_kid_and_counts_required_keys() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let readiness = SignerReadiness::from_entries(vec![
+            static_key_readiness(
+                "did:web:notary.example#local".to_string(),
+                true,
+                KeyReadiness::Ready,
+            ),
+            flag_key_readiness("did:web:notary.example#hsm".to_string(), true, flag.clone()),
+            static_key_readiness(
+                "did:web:notary.example#publish-only".to_string(),
+                false,
+                KeyReadiness::Ready,
+            ),
+        ]);
+
+        assert_eq!(readiness.total(), 2);
+        assert_eq!(readiness.ready_count(), 1);
+        assert_eq!(readiness.failed_count(), 1);
+        let by_kid = readiness
+            .by_kid()
+            .into_iter()
+            .map(|entry| (entry.kid, entry.readiness))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_kid["did:web:notary.example#local"], KeyReadiness::Ready);
+        assert_eq!(by_kid["did:web:notary.example#hsm"], KeyReadiness::NotReady);
+        assert_eq!(
+            by_kid["did:web:notary.example#publish-only"],
+            KeyReadiness::Ready
+        );
+
+        flag.store(true, Ordering::SeqCst);
+        assert!(readiness.is_ready());
+        assert_eq!(readiness.ready_count(), 2);
+    }
+
+    fn file_watch_key(path: &std::path::Path) -> SigningKeyConfig {
+        SigningKeyConfig {
+            provider: SigningKeyProviderConfig::FileWatch,
+            alg: "EdDSA".to_string(),
+            kid: "did:web:issuer.example#file-watch".to_string(),
+            status: registry_notary_core::SigningKeyStatus::Active,
+            publish_until_unix_seconds: None,
+            private_jwk_env: String::new(),
+            public_jwk_env: String::new(),
+            module_path: String::new(),
+            token_label: String::new(),
+            pin_env: String::new(),
+            key_label: String::new(),
+            key_id_hex: String::new(),
+            path: path.to_string_lossy().into_owned(),
+            password_env: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_watch_signing_key_reloads_valid_same_key_replacement_without_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("issuer.jwk");
+        std::fs::write(&key_path, TEST_ISSUER_JWK).expect("initial key writes");
+        let key = file_watch_key(&key_path);
+        let provider =
+            FileWatchSigningProvider::from_config("file-watch", &key).expect("provider builds");
+        let payload = b"registry-notary file-watch signer test";
+
+        let old_public = provider.public_jwk();
+        let old_signature = provider.sign(payload).await.expect("old signer signs");
+        verify(payload, &old_signature, &old_public).expect("old signature verifies");
+
+        std::fs::write(&key_path, TEST_ISSUER_JWK_WITH_KID).expect("replacement key writes");
+        let replacement_signature = provider
+            .sign(payload)
+            .await
+            .expect("replacement signer signs");
+        let replacement_public = provider.public_jwk();
+
+        assert_eq!(old_signature, replacement_signature);
+        assert_eq!(old_public, replacement_public);
+        assert_eq!(provider.readiness(), KeyReadiness::Ready);
+        verify(payload, &replacement_signature, &replacement_public)
+            .expect("replacement signature verifies");
+    }
+
+    #[test]
+    fn file_watch_signing_key_missing_initial_file_fails_closed_without_path_leak() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("missing-issuer.jwk");
+        let key = file_watch_key(&key_path);
+
+        let err = FileWatchSigningProvider::from_config("file-watch", &key)
+            .expect_err("missing watched key file fails startup");
+        let err = err.to_string();
+
+        assert!(err.contains("signing key 'file-watch' is invalid"));
+        assert!(err.contains("file_watch key file could not be read"));
+        let key_path_text = key_path.to_string_lossy();
+        assert!(!err.contains(key_path_text.as_ref() as &str));
+    }
+
+    #[tokio::test]
+    async fn file_watch_signing_key_keeps_last_good_signer_when_replacement_is_malformed() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("issuer.jwk");
+        std::fs::write(&key_path, TEST_ISSUER_JWK).expect("initial key writes");
+        let key = file_watch_key(&key_path);
+        let provider =
+            FileWatchSigningProvider::from_config("file-watch", &key).expect("provider builds");
+        let payload = b"registry-notary file-watch malformed replacement";
+        let old_public = provider.public_jwk();
+
+        std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        let signature = provider
+            .sign(payload)
+            .await
+            .expect("last good signer still signs");
+
+        assert_eq!(provider.readiness(), KeyReadiness::Degraded);
+        assert_eq!(provider.public_jwk(), old_public);
+        verify(payload, &signature, &old_public).expect("last good signature verifies");
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("FileWatchSigningProvider"));
+        let key_path_text = key_path.to_string_lossy();
+        assert!(!debug.contains(key_path_text.as_ref() as &str));
+        assert!(!debug.contains("2oPoxdKu"));
+
+        std::fs::write(&key_path, TEST_ROTATED_ISSUER_JWK)
+            .expect("wrong public-key replacement writes");
+        let signature = provider
+            .sign(payload)
+            .await
+            .expect("last good signer still signs after wrong-key replacement");
+        assert_eq!(provider.readiness(), KeyReadiness::Degraded);
+        assert_eq!(provider.public_jwk(), old_public);
+        verify(payload, &signature, &old_public).expect("wrong-key replacement was not swapped in");
+    }
+
+    #[tokio::test]
+    async fn file_watch_signing_key_readiness_is_reported_by_kid() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("issuer.jwk");
+        std::fs::write(&key_path, TEST_ISSUER_JWK).expect("initial key writes");
+        let key_path_text = key_path.to_string_lossy();
+        let evidence: EvidenceConfig = serde_norway::from_str(&format!(
+            r#"
+signing_keys:
+  active-key:
+    provider: file_watch
+    path: "{key_path_text}"
+    alg: EdDSA
+    kid: did:web:issuer.example#file-watch
+    status: active
+credential_profiles:
+  profile-a:
+    format: application/dc+sd-jwt
+    issuer: did:web:issuer.example
+    signing_key: active-key
+    vct: https://issuer.example/credentials/a
+    allowed_claims: [claim-a]
+"#
+        ))
+        .expect("evidence config parses");
+        let registry = SigningKeyRegistry::from_config(&evidence).expect("registry builds");
+        let readiness = registry.signer_readiness();
+        assert_eq!(
+            readiness.by_kid()[0].readiness,
+            KeyReadiness::Ready,
+            "initial file-watch key is ready"
+        );
+
+        std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        let provider = registry
+            .signing_provider("active-key")
+            .expect("active provider exists");
+        provider
+            .sign(b"registry-notary readiness refresh")
+            .await
+            .expect("last good signer still signs");
+
+        let by_kid = readiness
+            .by_kid()
+            .into_iter()
+            .map(|entry| (entry.kid, entry.readiness))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_kid["did:web:issuer.example#file-watch"],
+            KeyReadiness::Degraded
+        );
+    }
 
     #[test]
     fn cached_source_token_debug_redacts_access_token() {
@@ -5499,6 +6114,7 @@ mod tests {
             matching_outcome: None,
             matching_error_code: None,
             batch_items: None,
+            config: None,
         }
     }
 
@@ -5519,11 +6135,24 @@ mod tests {
         })
     }
 
+    fn public_jwk_with_kid(public_jwk: &str, kid: &str) -> String {
+        let mut value: Value = serde_json::from_str(public_jwk).expect("public JWK parses");
+        value["kid"] = json!(kid);
+        serde_json::to_string(&value).expect("public JWK serializes")
+    }
+
     #[test]
     fn issuer_registry_uses_active_key_and_publishes_rotated_keys_once() {
         unsafe {
             std::env::set_var("TEST_ACTIVE_SIGNING_JWK", TEST_ISSUER_JWK);
             std::env::set_var("TEST_OLD_SIGNING_PUBLIC_JWK", TEST_OLD_ISSUER_PUBLIC_JWK);
+            std::env::set_var(
+                "TEST_EXPIRED_OLD_SIGNING_PUBLIC_JWK",
+                public_jwk_with_kid(
+                    TEST_OLD_ISSUER_PUBLIC_JWK,
+                    "did:web:issuer.example#expired-old",
+                ),
+            );
             std::env::set_var("TEST_OLD_HSM_PUBLIC_JWK", TEST_OLD_HSM_PUBLIC_JWK);
             std::env::set_var("TEST_DISABLED_SIGNING_JWK", TEST_ISSUER_JWK);
         }
@@ -5549,6 +6178,13 @@ signing_keys:
     alg: EdDSA
     kid: did:web:issuer.example#hsm-old
     status: publish_only
+  expired-old-key:
+    provider: local_jwk_env
+    public_jwk_env: TEST_EXPIRED_OLD_SIGNING_PUBLIC_JWK
+    alg: EdDSA
+    kid: did:web:issuer.example#expired-old
+    status: publish_only
+    publish_until_unix_seconds: 1
   disabled-key:
     provider: local_jwk_env
     private_jwk_env: TEST_DISABLED_SIGNING_JWK
@@ -5587,6 +6223,9 @@ credential_profiles:
         assert!(jwks
             .iter()
             .any(|jwk| jwk["kid"] == "did:web:issuer.example#hsm-old"));
+        assert!(!jwks
+            .iter()
+            .any(|jwk| jwk["kid"] == "did:web:issuer.example#expired-old"));
         assert!(!jwks
             .iter()
             .any(|jwk| jwk["kid"] == "did:web:issuer.example#disabled"));
@@ -5988,6 +6627,7 @@ credential_profiles:
             matching_outcome: Some("matched".to_string()),
             matching_error_code: None,
             batch_items: None,
+            ..EvidenceAuditContext::default()
         });
 
         let event = build_audit_event(

@@ -2250,6 +2250,43 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
         );
     }
 
+    #[tokio::test]
+    async fn run_server_compiles_runtime_before_binding_listener() {
+        let held_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let held_addr = held_listener
+            .local_addr()
+            .expect("test listener exposes local addr");
+        let config_path = std::env::temp_dir().join(format!(
+            "registry-notary-invalid-startup-{}.yaml",
+            Ulid::new()
+        ));
+        let config = doctor_live_test_config("http://127.0.0.1:1");
+        fs::write(
+            &config_path,
+            serde_norway::to_string(&config).expect("startup config serializes"),
+        )
+        .expect("invalid startup config writes");
+
+        let error = run_server(&config_path, Some(held_addr))
+            .await
+            .expect_err("invalid runtime config fails before serving");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("TEST_DOCTOR_OAUTH_CLIENT_ID")
+                || message.contains("audit.hash_secret_env"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("Address already in use"),
+            "server bound before compile failure: {message}"
+        );
+
+        let _ = fs::remove_file(config_path);
+        drop(held_listener);
+    }
+
     #[test]
     fn bind_cli_override_wins_over_env() {
         let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");

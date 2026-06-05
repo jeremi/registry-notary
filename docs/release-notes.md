@@ -12,8 +12,9 @@
   profile with hardened worker execution, startup expression preflight,
   declared result-type enforcement, and policy-hash worker protocol checks.
 - Added named SD-JWT VC signing keys under `evidence.signing_keys`, including
-  local JWK signing, publish-only rotation keys, disabled keys, and optional
-  PKCS#11-backed Ed25519 signing.
+  local JWK signing, publish-only rotation keys with optional bounded
+  publication windows, disabled keys, and optional PKCS#11-backed Ed25519
+  signing.
 - Product binaries and container images now compile the PKCS#11 provider by
   default, while vendor modules, token state, labels, and PIN handling remain
   operator-supplied runtime configuration.

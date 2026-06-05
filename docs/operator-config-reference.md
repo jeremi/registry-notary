@@ -39,6 +39,7 @@ the basic path passes `doctor`.
 | `server` | Bind address and process HTTP settings | No, defaults are present |
 | `auth` | Caller authentication and scope mapping | Yes |
 | `audit` | Redacted audit envelope sink and HMAC secret | Recommended for every deployable environment |
+| `config_trust` | Durable local state for governed config apply | No, only for signed governed config |
 | `evidence` | Claims, sources, rules, formats, signing keys, and credential profiles | Yes |
 | `cel` | Optional CEL worker policy, limits, and regex posture | Defaults are present |
 | `replay` | One-time-use store for federation request JWTs, OID4VCI nonces, and holder proof JWTs | Defaults to in-process memory |
@@ -60,7 +61,9 @@ Config files should contain names, not secret values.
 | Static upstream source token | `evidence.source_connections.<id>.token_env` | Raw upstream bearer token |
 | OAuth2 client credential source auth | `source_auth.client_id_env`, `source_auth.client_secret_env` | OAuth client id and secret |
 | Local JWK signing key | `evidence.signing_keys.<id>.private_jwk_env` | Private Ed25519 JWK JSON |
+| Watched local JWK signing key | `evidence.signing_keys.<id>.path` with `provider: file_watch` | Private Ed25519 JWK JSON in a host-local file |
 | Publish-only JWK | `evidence.signing_keys.<id>.public_jwk_env` | Public JWK JSON |
+| Publish-only deadline | `evidence.signing_keys.<id>.publish_until_unix_seconds` | Optional public metadata, not a secret |
 | PKCS#11 PIN | `evidence.signing_keys.<id>.pin_env` | HSM token PIN |
 | Audit hashing | `audit.hash_secret_env` | Stable high-entropy HMAC secret |
 | Redis stores | `replay.redis.url_env`, `credential_status.redis.url_env` | Redis connection URL |
@@ -75,9 +78,62 @@ lookup, and running the startup self-test. Run `registry-notary build-info` on
 the deployed artifact to confirm the `pkcs11` capability is compiled in before
 debugging token or vendor module configuration.
 
+For local no-restart key material refresh, use `provider: file_watch` with a
+host-local private JWK file path. The file is read at startup and re-read on
+signing use. A valid replacement with the same configured `kid`, `alg`, and
+public JWK identity is picked up without process restart; a malformed, missing,
+or different-public-key replacement marks the key degraded and keeps the last
+good signer serving. Use a new `kid` and governed config change for real key
+rotation.
+
 For local development, the binary accepts `--env-file`. For shared
 environments, prefer the platform secret store and avoid checking dotenv files
 into the repository.
+
+## Governed Config Apply
+
+```yaml
+config_trust:
+  antirollback_state_path: /var/lib/registry-notary/config-antirollback.json
+  accepted_roots:
+    - root_id: ops-root
+      production: false
+      tuf_root_sha256: sha256:REPLACE_WITH_FINAL_VERIFIED_TUF_ROOT_METADATA_HASH
+      valid_from_unix_seconds: 1770000000
+      valid_until_unix_seconds: 1772592000
+      signers:
+        TUF_TARGETS_ROLE_KEY_ID_A:
+          kid: TUF_TARGETS_ROLE_KEY_ID_A
+          enabled: true
+      roles:
+        - name: config-admin
+          threshold: 1
+          signer_kids: [TUF_TARGETS_ROLE_KEY_ID_A]
+          allowed_change_classes: [public_metadata]
+```
+
+`config_trust` is optional. Simple local deployments omit it and keep using the
+local YAML loaded at startup. Governed config apply requires
+`antirollback_state_path`, which must point to durable local state such as a
+mounted volume. `accepted_roots` uses the shared Registry trust-root shape.
+Standalone Registry Notary verifies local signed TUF config targets against
+`accepted_roots` when the admin request provides a `tuf` source. Verified TUF
+targets-role signature key IDs, not target-declared custom metadata, satisfy the
+role threshold. Inline YAML remains available for verify/dry-run diagnostics.
+For TUF root rotation, add the new final `tuf_root_sha256` as another local
+`accepted_roots` entry before applying bundles that verify through the rotated
+root. `valid_from_unix_seconds` and `valid_until_unix_seconds` are optional
+local bounds for overlap windows; expired or not-yet-valid roots fail
+authorization even when TUF verification and signer quorum otherwise succeed.
+`POST /admin/v1/config/apply` can hot-apply governed signed credential issuer
+key rotations after TUF verification, trust-root authorization, and local
+anti-rollback acceptance. Other changes continue to reject with
+`rejected_restart_required`, so rejected signed targets do not advance
+anti-rollback state or change active posture provenance. Break-glass apply is
+available only for signed targets whose target metadata includes the local
+approval's `emergency_change_class`; the approval record, expiry, and
+rate-limit policy stay local to the admin request and are audited without the
+raw reason text.
 
 ## Minimal Machine Config
 
@@ -121,6 +177,12 @@ evidence:
       private_jwk_env: REGISTRY_NOTARY_ISSUER_JWK
       alg: EdDSA
       kid: did:web:notary.example.gov#issuer-2026-05
+      status: active
+    issuer-file-watch:
+      provider: file_watch
+      path: /run/secrets/registry-notary/issuer.jwk
+      alg: EdDSA
+      kid: did:web:notary.example.gov#issuer-file-watch
       status: active
   credential_profiles:
     birth_record_sd_jwt:
@@ -723,7 +785,8 @@ registry-notary doctor \
 - Claims read only required upstream fields.
 - Credential profiles list explicit `allowed_claims`.
 - Signing keys are active only when they may sign; old public keys are
-  `publish_only` until verifiers no longer need them.
+  `publish_only` until their configured publication window ends or verifiers no
+  longer need them.
 - Multi-instance deployments use Redis replay storage.
 - Credential status, if enabled, uses the externally reachable issuer base URL
   and a shared store.
