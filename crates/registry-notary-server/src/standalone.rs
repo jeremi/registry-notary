@@ -1298,12 +1298,26 @@ struct SignerReadinessEntry {
     state: SignerReadinessState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum SignerReadinessState {
     Static(KeyReadiness),
     #[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
     Flag(Arc<AtomicBool>),
-    Watched(Arc<AtomicU8>),
+    Provider(Arc<dyn SigningProvider>),
+}
+
+impl std::fmt::Debug for SignerReadinessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(readiness) => f.debug_tuple("Static").field(readiness).finish(),
+            Self::Flag(_) => f.write_str("Flag(..)"),
+            Self::Provider(provider) => f
+                .debug_struct("Provider")
+                .field("kid", &provider.key_id())
+                .field("readiness", &provider.readiness())
+                .finish(),
+        }
+    }
 }
 
 impl SignerReadinessEntry {
@@ -1312,9 +1326,7 @@ impl SignerReadinessEntry {
             SignerReadinessState::Static(readiness) => *readiness,
             SignerReadinessState::Flag(flag) if flag.load(Ordering::SeqCst) => KeyReadiness::Ready,
             SignerReadinessState::Flag(_) => KeyReadiness::NotReady,
-            SignerReadinessState::Watched(state) => {
-                key_readiness_from_u8(state.load(Ordering::SeqCst))
-            }
+            SignerReadinessState::Provider(provider) => provider.readiness(),
         }
     }
 }
@@ -1424,6 +1436,11 @@ impl SigningKeyRegistry {
                     if key.status.may_sign() {
                         let provider: Arc<dyn SigningProvider> =
                             Arc::new(build_local_jwk_signer(key_id, key)?);
+                        readiness_entries.push(provider_key_readiness(
+                            key.kid.clone(),
+                            true,
+                            Arc::clone(&provider),
+                        ));
                         let issuer = EvidenceIssuer::from_signing_provider(Arc::clone(&provider))
                             .map_err(|_| {
                             invalid_signing_key(key_id, "local signer failed self-test")
@@ -1431,11 +1448,6 @@ impl SigningKeyRegistry {
                         let public_jwk = issuer.public_jwk();
                         issuers.insert(key_id.clone(), issuer);
                         providers.insert(key_id.clone(), provider);
-                        readiness_entries.push(static_key_readiness(
-                            key.kid.clone(),
-                            true,
-                            KeyReadiness::Ready,
-                        ));
                         public_jwk
                     } else {
                         readiness_entries.push(static_key_readiness(
@@ -1451,12 +1463,12 @@ impl SigningKeyRegistry {
                         #[cfg(feature = "pkcs11")]
                         {
                             let provider = pkcs11::Pkcs11SigningProvider::from_config(key_id, key)?;
-                            readiness_entries.push(flag_key_readiness(
+                            let provider: Arc<dyn SigningProvider> = Arc::new(provider);
+                            readiness_entries.push(provider_key_readiness(
                                 key.kid.clone(),
                                 true,
-                                provider.readiness_flag(),
+                                Arc::clone(&provider),
                             ));
-                            let provider: Arc<dyn SigningProvider> = Arc::new(provider);
                             let issuer =
                                 EvidenceIssuer::from_signing_provider(Arc::clone(&provider))
                                     .map_err(|_| {
@@ -1488,12 +1500,12 @@ impl SigningKeyRegistry {
                 SigningKeyProviderConfig::FileWatch => {
                     if key.status.may_sign() {
                         let provider = FileWatchSigningProvider::from_config(key_id, key)?;
-                        readiness_entries.push(watched_key_readiness(
+                        let provider: Arc<dyn SigningProvider> = Arc::new(provider);
+                        readiness_entries.push(provider_key_readiness(
                             key.kid.clone(),
                             true,
-                            provider.readiness_state(),
+                            Arc::clone(&provider),
                         ));
-                        let provider: Arc<dyn SigningProvider> = Arc::new(provider);
                         let issuer = EvidenceIssuer::from_signing_provider(Arc::clone(&provider))
                             .map_err(|_| {
                             invalid_signing_key(key_id, "file-watch signer failed self-test")
@@ -1626,28 +1638,15 @@ fn static_key_readiness(
     }
 }
 
-#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
-fn flag_key_readiness(
+fn provider_key_readiness(
     kid: String,
     required_for_signing: bool,
-    flag: Arc<AtomicBool>,
+    provider: Arc<dyn SigningProvider>,
 ) -> SignerReadinessEntry {
     SignerReadinessEntry {
         kid,
         required_for_signing,
-        state: SignerReadinessState::Flag(flag),
-    }
-}
-
-fn watched_key_readiness(
-    kid: String,
-    required_for_signing: bool,
-    state: Arc<AtomicU8>,
-) -> SignerReadinessEntry {
-    SignerReadinessEntry {
-        kid,
-        required_for_signing,
-        state: SignerReadinessState::Watched(state),
+        state: SignerReadinessState::Provider(provider),
     }
 }
 
@@ -1726,11 +1725,8 @@ impl FileWatchSigningProvider {
     }
 
     fn readiness(&self) -> KeyReadiness {
+        self.refresh();
         key_readiness_from_u8(self.readiness.load(Ordering::SeqCst))
-    }
-
-    fn readiness_state(&self) -> Arc<AtomicU8> {
-        Arc::clone(&self.readiness)
     }
 
     fn current_signer(&self) -> LocalJwkSigner {
@@ -1790,6 +1786,10 @@ impl SigningProvider for FileWatchSigningProvider {
         payload: &[u8],
     ) -> Result<Vec<u8>, registry_platform_crypto::SigningError> {
         self.current_signer().sign(payload).await
+    }
+
+    fn readiness(&self) -> KeyReadiness {
+        self.readiness()
     }
 }
 
@@ -2606,7 +2606,7 @@ mod pkcs11 {
     use cryptoki::types::AuthPin;
     use registry_notary_core::SigningKeyConfig;
     use registry_platform_crypto::{
-        verify, PublicJwk, SigningAlgorithm, SigningError, SigningProvider,
+        verify, KeyReadiness, PublicJwk, SigningAlgorithm, SigningError, SigningProvider,
     };
     use tokio::sync::Semaphore;
     use zeroize::Zeroizing;
@@ -2702,10 +2702,6 @@ mod pkcs11 {
             };
             provider.self_test(config_key_id)?;
             Ok(provider)
-        }
-
-        pub(super) fn readiness_flag(&self) -> Arc<AtomicBool> {
-            Arc::clone(&self.ready)
         }
 
         fn self_test(&self, config_key_id: &str) -> Result<(), StandaloneServerError> {
@@ -2862,6 +2858,14 @@ mod pkcs11 {
                 ),
             }
             result
+        }
+
+        fn readiness(&self) -> KeyReadiness {
+            if self.ready.load(Ordering::SeqCst) {
+                KeyReadiness::Ready
+            } else {
+                KeyReadiness::NotReady
+            }
         }
     }
 
@@ -5920,16 +5924,58 @@ mod tests {
     #[cfg(feature = "pkcs11")]
     static SOFTHSM_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[derive(Debug)]
+    struct TestReadinessProvider {
+        signer: LocalJwkSigner,
+        readiness: Arc<AtomicU8>,
+    }
+
+    #[async_trait]
+    impl SigningProvider for TestReadinessProvider {
+        fn algorithm(&self) -> registry_platform_crypto::SigningAlgorithm {
+            self.signer.algorithm()
+        }
+
+        fn key_id(&self) -> &str {
+            self.signer.key_id()
+        }
+
+        fn public_jwk(&self) -> PublicJwk {
+            self.signer.public_jwk()
+        }
+
+        fn readiness(&self) -> KeyReadiness {
+            key_readiness_from_u8(self.readiness.load(Ordering::SeqCst))
+        }
+
+        async fn sign(
+            &self,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, registry_platform_crypto::SigningError> {
+            self.signer.sign(payload).await
+        }
+    }
+
     #[test]
     fn signer_readiness_tracks_status_by_kid_and_counts_required_keys() {
-        let flag = Arc::new(AtomicBool::new(false));
+        let provider_readiness =
+            Arc::new(AtomicU8::new(key_readiness_to_u8(KeyReadiness::NotReady)));
+        let provider: Arc<dyn SigningProvider> = Arc::new(TestReadinessProvider {
+            signer: LocalJwkSigner::new(PrivateJwk::parse(TEST_ISSUER_JWK_WITH_KID).expect("jwk"))
+                .expect("local signer builds"),
+            readiness: Arc::clone(&provider_readiness),
+        });
         let readiness = SignerReadiness::from_entries(vec![
             static_key_readiness(
                 "did:web:notary.example#local".to_string(),
                 true,
                 KeyReadiness::Ready,
             ),
-            flag_key_readiness("did:web:notary.example#hsm".to_string(), true, flag.clone()),
+            provider_key_readiness(
+                "did:web:notary.example#hsm".to_string(),
+                true,
+                Arc::clone(&provider),
+            ),
             static_key_readiness(
                 "did:web:notary.example#publish-only".to_string(),
                 false,
@@ -5952,7 +5998,7 @@ mod tests {
             KeyReadiness::Ready
         );
 
-        flag.store(true, Ordering::SeqCst);
+        provider_readiness.store(key_readiness_to_u8(KeyReadiness::Ready), Ordering::SeqCst);
         assert!(readiness.is_ready());
         assert_eq!(readiness.ready_count(), 2);
     }
@@ -6055,6 +6101,27 @@ mod tests {
         assert_eq!(provider.readiness(), KeyReadiness::Degraded);
         assert_eq!(provider.public_jwk(), old_public);
         verify(payload, &signature, &old_public).expect("wrong-key replacement was not swapped in");
+    }
+
+    #[tokio::test]
+    async fn file_watch_signing_provider_reports_readiness_through_shared_trait() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("issuer.jwk");
+        std::fs::write(&key_path, TEST_ISSUER_JWK).expect("initial key writes");
+        let key = file_watch_key(&key_path);
+        let provider =
+            FileWatchSigningProvider::from_config("file-watch", &key).expect("provider builds");
+        let provider: Arc<dyn SigningProvider> = Arc::new(provider);
+
+        assert_eq!(provider.readiness(), KeyReadiness::Ready);
+
+        std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        provider
+            .sign(b"registry-notary shared readiness")
+            .await
+            .expect("last good signer still signs");
+
+        assert_eq!(provider.readiness(), KeyReadiness::Degraded);
     }
 
     #[tokio::test]
