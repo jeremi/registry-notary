@@ -1122,6 +1122,15 @@ fn tamper_jwt_signature(jwt: &str) -> String {
 
 #[cfg(feature = "registry-notary-cel")]
 fn verified_federation_response_claims(jwt: &str) -> Value {
+    verified_federation_response_claims_with_key(jwt, "agency-a-fed-1", TEST_ISSUER_JWK)
+}
+
+#[cfg(feature = "registry-notary-cel")]
+fn verified_federation_response_claims_with_key(
+    jwt: &str,
+    expected_kid: &str,
+    private_jwk: &str,
+) -> Value {
     let parts = jwt.split('.').collect::<Vec<_>>();
     assert_eq!(parts.len(), 3, "compact JWT response has three segments");
     let header: Value = serde_json::from_slice(
@@ -1132,13 +1141,13 @@ fn verified_federation_response_claims(jwt: &str) -> Value {
     .expect("response header is JSON");
     assert_eq!(header["alg"], json!("EdDSA"));
     assert_eq!(header["typ"], json!(FEDERATION_RESPONSE_JWT_TYP));
-    assert_eq!(header["kid"], json!("agency-a-fed-1"));
+    assert_eq!(header["kid"], json!(expected_kid));
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let signature = URL_SAFE_NO_PAD
         .decode(parts[2])
         .expect("response signature is base64url");
-    let public = PrivateJwk::parse(TEST_ISSUER_JWK)
-        .expect("issuer JWK parses")
+    let public = PrivateJwk::parse(private_jwk)
+        .expect("private JWK parses")
         .public();
     verify(signing_input.as_bytes(), &signature, &public).expect("response signature verifies");
     let payload = URL_SAFE_NO_PAD
@@ -1627,6 +1636,241 @@ async fn federation_evaluation_returns_signed_response_and_rejects_replay() {
     assert!(!metrics_body.contains("01J9Z6Q6Q6Q6Q6Q6Q6Q6Q6Q6Q6"));
     assert!(!metrics_body.contains("person-1"));
     assert!(!metrics_body.contains("source-token"));
+}
+
+#[tokio::test]
+#[cfg(feature = "registry-notary-cel")]
+async fn admin_config_apply_signed_federation_signing_rotation_swaps_without_restart() {
+    set_federation_env();
+    std::env::set_var("TEST_FEDERATION_SIGNING_KEY_2", TEST_HOLDER_JWK);
+    std::env::set_var(
+        "TEST_FEDERATION_SIGNING_KEY_OLD_PUBLIC",
+        public_jwk_env_value(TEST_ISSUER_JWK, "agency-a-fed-1"),
+    );
+    let upstream = TestServer::builder()
+        .http_transport()
+        .build(Router::new().route(
+            "/v1/datasets/farmer_registry/entities/farmer/records",
+            get(registry_data_api),
+        ));
+    let base_url = upstream
+        .server_address()
+        .expect("HTTP transport exposes upstream address")
+        .to_string();
+    let peer_jwks = MockHttpUpstream::start().await;
+    let (peer_private, _) = fixtures::ed25519_pair();
+    peer_jwks
+        .expect("GET", "/jwks")
+        .respond_json(200, jwks_from_private_jwk(&peer_private))
+        .await;
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = federation_config(
+        base_url.trim_end_matches('/'),
+        audit_path.to_str().expect("audit path is UTF-8"),
+        &format!("{}/jwks", peer_jwks.url()),
+    );
+    add_admin_api_key(&mut config);
+    add_config_trust(&mut config, antirollback_path.clone());
+    let app = standalone_router(config.clone()).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+
+    let before = server
+        .post("/federation/v1/evaluations")
+        .add_header("content-type", "application/jwt")
+        .bytes(Bytes::from(federation_request_jwt(
+            "01J9Z6Q6Q6Q6Q6Q6Q6Q6Q6F1A1",
+            "https://purpose.example.test/eligibility",
+        )))
+        .await;
+    before.assert_status_ok();
+    verified_federation_response_claims(&before.text());
+
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+    let mut candidate = config.clone();
+    let publish_until_unix_seconds =
+        u64::try_from((OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp())
+            .expect("future timestamp fits u64");
+    let old_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("federation-key")
+        .expect("federation signing key exists");
+    old_key.status = SigningKeyStatus::PublishOnly;
+    old_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_key.private_jwk_env.clear();
+    old_key.public_jwk_env = "TEST_FEDERATION_SIGNING_KEY_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "federation-key-2".to_string(),
+        local_jwk_signing_key("TEST_FEDERATION_SIGNING_KEY_2", "agency-a-fed-2"),
+    );
+    candidate.federation.signing.signing_key = "federation-key-2".to_string();
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let wrong_class_signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["public_metadata"],
+    )
+    .await;
+    let wrong_class_apply = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&wrong_class_signed))
+        .await;
+    wrong_class_apply.assert_status(StatusCode::CONFLICT);
+    let wrong_class_body: Value = wrong_class_apply.json();
+    assert_eq!(
+        wrong_class_body["result"],
+        json!("rejected_restart_required")
+    );
+    assert_eq!(wrong_class_body["restart_required"], json!(true));
+
+    let still_old = server
+        .post("/federation/v1/evaluations")
+        .add_header("content-type", "application/jwt")
+        .bytes(Bytes::from(federation_request_jwt(
+            "01J9Z6Q6Q6Q6Q6Q6Q6Q6Q6F1A0",
+            "https://purpose.example.test/eligibility",
+        )))
+        .await;
+    still_old.assert_status_ok();
+    verified_federation_response_claims(&still_old.text());
+
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        3,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["signing_key_rotation"],
+    )
+    .await;
+
+    let apply = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+    apply.assert_status_ok();
+    let body: Value = apply.json();
+    assert_eq!(body["result"], json!("applied"));
+    assert_eq!(body["restart_required"], json!(false));
+
+    let after = server
+        .post("/federation/v1/evaluations")
+        .add_header("content-type", "application/jwt")
+        .bytes(Bytes::from(federation_request_jwt(
+            "01J9Z6Q6Q6Q6Q6Q6Q6Q6Q6F1A2",
+            "https://purpose.example.test/eligibility",
+        )))
+        .await;
+    after.assert_status_ok();
+    verified_federation_response_claims_with_key(&after.text(), "agency-a-fed-2", TEST_HOLDER_JWK);
+}
+
+#[tokio::test]
+#[cfg(feature = "registry-notary-cel")]
+async fn admin_config_apply_signed_federation_signing_rotation_rejects_extra_federation_changes() {
+    set_federation_env();
+    std::env::set_var("TEST_FEDERATION_SIGNING_KEY_2", TEST_HOLDER_JWK);
+    std::env::set_var(
+        "TEST_FEDERATION_SIGNING_KEY_OLD_PUBLIC",
+        public_jwk_env_value(TEST_ISSUER_JWK, "agency-a-fed-1"),
+    );
+    let upstream = TestServer::builder()
+        .http_transport()
+        .build(Router::new().route(
+            "/v1/datasets/farmer_registry/entities/farmer/records",
+            get(registry_data_api),
+        ));
+    let base_url = upstream
+        .server_address()
+        .expect("HTTP transport exposes upstream address")
+        .to_string();
+    let peer_jwks = MockHttpUpstream::start().await;
+    let (peer_private, _) = fixtures::ed25519_pair();
+    peer_jwks
+        .expect("GET", "/jwks")
+        .respond_json(200, jwks_from_private_jwk(&peer_private))
+        .await;
+    let tmp = TempDir::new().expect("tempdir");
+    let audit_path = tmp.path().join("audit.jsonl");
+    let antirollback_path = tmp.path().join("config-antirollback.json");
+    let mut config = federation_config(
+        base_url.trim_end_matches('/'),
+        audit_path.to_str().expect("audit path is UTF-8"),
+        &format!("{}/jwks", peer_jwks.url()),
+    );
+    add_admin_api_key(&mut config);
+    add_config_trust(&mut config, antirollback_path.clone());
+    let current_config_yaml = serde_norway::to_string(&config).expect("current config serializes");
+    initialize_notary_antirollback_state(&antirollback_path, &current_config_yaml, 1);
+    let current_config_hash = internal_config_hash(current_config_yaml.as_bytes());
+
+    let mut candidate = config.clone();
+    let publish_until_unix_seconds =
+        u64::try_from((OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp())
+            .expect("future timestamp fits u64");
+    let old_key = candidate
+        .evidence
+        .signing_keys
+        .get_mut("federation-key")
+        .expect("federation signing key exists");
+    old_key.status = SigningKeyStatus::PublishOnly;
+    old_key.publish_until_unix_seconds = Some(publish_until_unix_seconds);
+    old_key.private_jwk_env.clear();
+    old_key.public_jwk_env = "TEST_FEDERATION_SIGNING_KEY_OLD_PUBLIC".to_string();
+    candidate.evidence.signing_keys.insert(
+        "federation-key-2".to_string(),
+        local_jwk_signing_key("TEST_FEDERATION_SIGNING_KEY_2", "agency-a-fed-2"),
+    );
+    candidate.federation.signing.signing_key = "federation-key-2".to_string();
+    candidate.federation.clock_leeway_seconds += 1;
+    let candidate_yaml = serde_norway::to_string(&candidate).expect("candidate serializes");
+    let signed = write_signed_notary_config_tuf_fixture_with_change_classes(
+        &tmp,
+        &current_config_hash,
+        &candidate_yaml,
+        2,
+        "registry-notary-standalone",
+        &["kid-a", "kid-b"],
+        &["signing_key_rotation"],
+    )
+    .await;
+
+    let app = standalone_router(config).expect("standalone router builds");
+    let server = TestServer::builder().http_transport().build(app);
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("x-api-key", "admin-token")
+        .json(&signed_tuf_apply_request(&signed))
+        .await;
+
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(body["result"], json!("rejected_restart_required"));
+    assert_eq!(body["posture_result"], json!("rejected"));
+    assert_eq!(body["applied"], json!(false));
+    assert_eq!(body["restart_required"], json!(true));
+
+    let after = server
+        .post("/federation/v1/evaluations")
+        .add_header("content-type", "application/jwt")
+        .bytes(Bytes::from(federation_request_jwt(
+            "01J9Z6Q6Q6Q6Q6Q6Q6Q6Q6F1B1",
+            "https://purpose.example.test/eligibility",
+        )))
+        .await;
+    after.assert_status_ok();
+    verified_federation_response_claims(&after.text());
 }
 
 #[tokio::test]

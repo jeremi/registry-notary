@@ -125,11 +125,13 @@ For TUF root rotation, add the new final `tuf_root_sha256` as another local
 root. `valid_from_unix_seconds` and `valid_until_unix_seconds` are optional
 local bounds for overlap windows; expired or not-yet-valid roots fail
 authorization even when TUF verification and signer quorum otherwise succeed.
-`POST /admin/v1/config/apply` can hot-apply governed signed credential issuer
-key rotations after TUF verification, trust-root authorization, and local
-anti-rollback acceptance. Other changes continue to reject with
-`rejected_restart_required`, so rejected signed targets do not advance
-anti-rollback state or change active posture provenance. Break-glass apply is
+`POST /admin/v1/config/apply` can hot-apply governed signed signing-key
+rotations for credential issuer, pre-authorized access-token, eSignet
+client-assertion, and federation response signing paths after TUF verification,
+trust-root authorization, and local anti-rollback acceptance. Other changes
+continue to reject with `rejected_restart_required`, so rejected signed targets
+do not advance anti-rollback state or change active posture provenance.
+Break-glass apply is
 available only for signed targets whose target metadata includes the local
 approval's `emergency_change_class`; the approval record, expiry, and
 rate-limit policy stay local to the admin request and are audited without the

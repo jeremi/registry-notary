@@ -315,7 +315,7 @@ async fn admin_config_verify(
             ),
         );
     }
-    let classification = if candidate.source == ConfigSource::SignedBundleFile {
+    let classification = if signed_bundle_allows_signing_key_rotation(&candidate) {
         classify_credential_issuer_rotation(&state, &candidate_config)
     } else {
         Err(CredentialIssuerRotationError::RestartRequired)
@@ -587,6 +587,25 @@ async fn admin_config_apply(
             ),
         );
     }
+    if !signed_bundle_allows_signing_key_rotation(&candidate) {
+        consume_apply_metadata(&request);
+        return config_apply_report(
+            candidate.bundle_id.clone(),
+            candidate.sequence,
+            ApplyReportResult::RejectedRestartRequired,
+            false,
+            true,
+            StatusCode::CONFLICT,
+            resolved_config_audit(
+                ConfigAdminAction::Apply,
+                &candidate,
+                "accepted",
+                ApplyReportResult::RejectedRestartRequired.as_str(),
+                false,
+                true,
+            ),
+        );
+    }
     let issuer_rotation = match classify_credential_issuer_rotation(&state, &candidate_config) {
         Ok(rotation) => rotation,
         Err(CredentialIssuerRotationError::RestartRequired) => {
@@ -706,6 +725,7 @@ async fn admin_config_apply(
         issuer_rotation.signer_readiness,
     );
     state.swap_preauth_runtime(issuer_rotation.preauth);
+    state.swap_federation_runtime(issuer_rotation.federation);
     state.record_config_apply(ConfigApplyPosture {
         source: candidate.source,
         last_config_hash: Some(posture_hash(&candidate_config)),
@@ -732,6 +752,11 @@ async fn admin_config_apply(
         )
         .with_break_glass_request(&request),
     )
+}
+
+fn signed_bundle_allows_signing_key_rotation(candidate: &ResolvedConfigCandidate) -> bool {
+    candidate.source == ConfigSource::SignedBundleFile
+        && candidate.change_classes.contains("signing_key_rotation")
 }
 
 fn break_glass_proposal(
@@ -810,6 +835,7 @@ struct CredentialIssuerRotation {
     issuers: Arc<dyn EvidenceIssuerResolver>,
     signer_readiness: SignerReadiness,
     preauth: Option<Arc<PreAuthRuntime>>,
+    federation: Option<Arc<crate::federation::FederationRuntimeState>>,
 }
 
 enum CredentialIssuerRotationError {
@@ -845,10 +871,21 @@ fn classify_credential_issuer_rotation(
         previous_preauth.as_deref(),
     )
     .map_err(|_| CredentialIssuerRotationError::Readiness)?;
+    let federation = crate::standalone::federation_runtime_from_config(
+        candidate,
+        state
+            .auth_state
+            .as_ref()
+            .map(|auth_state| auth_state.audit_pipeline()),
+        state.replay.store(),
+        Arc::clone(&state.metrics),
+    )
+    .map_err(|_| CredentialIssuerRotationError::Readiness)?;
     Ok(CredentialIssuerRotation {
         issuers,
         signer_readiness,
         preauth,
+        federation,
     })
 }
 
@@ -899,6 +936,14 @@ fn normalize_notary_signing_rotation_fields(value: &mut Value) {
     {
         esignet.remove("client_signing_key_id");
     }
+    if let Some(signing) = value
+        .get_mut("federation")
+        .and_then(Value::as_object_mut)
+        .and_then(|federation| federation.get_mut("signing"))
+        .and_then(Value::as_object_mut)
+    {
+        signing.remove("signing_key");
+    }
 }
 
 fn notary_signing_key_reference_changed(
@@ -932,6 +977,7 @@ fn notary_signing_key_reference_changed(
                 .pre_authorized_code
                 .esignet
                 .client_signing_key_id
+        || current.federation.signing.signing_key != candidate.federation.signing.signing_key
 }
 
 fn changed_signing_keys_are_rotation_keys(
@@ -988,6 +1034,10 @@ fn changed_signing_keys_are_rotation_keys(
                 .as_str(),
         );
     }
+    if current.federation.signing.signing_key != candidate.federation.signing.signing_key {
+        allowed.insert(current.federation.signing.signing_key.as_str());
+        allowed.insert(candidate.federation.signing.signing_key.as_str());
+    }
     let mut keys = BTreeSet::new();
     keys.extend(current.evidence.signing_keys.keys().map(String::as_str));
     keys.extend(candidate.evidence.signing_keys.keys().map(String::as_str));
@@ -1034,6 +1084,9 @@ fn old_referenced_keys_are_safe_for_rotation(
                 .client_signing_key_id
                 .as_str(),
         );
+    }
+    if current.federation.signing.signing_key != candidate.federation.signing.signing_key {
+        old_key_ids.insert(current.federation.signing.signing_key.as_str());
     }
     for key_id in old_key_ids {
         old_key_is_safe_for_rotation(&current.evidence, &candidate.evidence, key_id)?;
@@ -1771,7 +1824,7 @@ pub struct RegistryNotaryApiState {
     pub(crate) self_attestation: Arc<SelfAttestationConfig>,
     pub(crate) oid4vci: Arc<Oid4vciConfig>,
     pub(crate) federation: Arc<FederationConfig>,
-    pub(crate) federation_runtime: Option<Arc<crate::federation::FederationRuntimeState>>,
+    federation_runtime: Arc<RwLock<Option<Arc<crate::federation::FederationRuntimeState>>>>,
     self_attestation_rate_limiter: Arc<SelfAttestationRateLimiter>,
     pub(crate) self_attestation_rate_keys: Arc<SelfAttestationRateLimitKeys>,
     pub(crate) replay: ReplayStores,
@@ -2013,7 +2066,7 @@ impl RegistryNotaryApiState {
             self_attestation,
             oid4vci,
             federation,
-            federation_runtime,
+            federation_runtime: Arc::new(RwLock::new(federation_runtime)),
             self_attestation_rate_limiter,
             self_attestation_rate_keys,
             replay,
@@ -2087,6 +2140,15 @@ impl RegistryNotaryApiState {
             .clone()
     }
 
+    pub(crate) fn federation_runtime(
+        &self,
+    ) -> Option<Arc<crate::federation::FederationRuntimeState>> {
+        self.federation_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub(crate) fn config_apply_posture(&self) -> ConfigApplyPosture {
         self.config_apply_posture
             .read()
@@ -2140,6 +2202,16 @@ impl RegistryNotaryApiState {
             .preauth
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = preauth;
+    }
+
+    fn swap_federation_runtime(
+        &self,
+        federation: Option<Arc<crate::federation::FederationRuntimeState>>,
+    ) {
+        *self
+            .federation_runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = federation;
     }
 
     fn notary_auth_anchor_for_config(

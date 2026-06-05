@@ -131,6 +131,35 @@ pub(crate) fn preauth_runtime_from_config_preserving_stores(
         .map(|runtime| runtime.map(Arc::new))
 }
 
+pub(crate) fn federation_runtime_from_config(
+    config: &StandaloneRegistryNotaryConfig,
+    audit: Option<AuditPipeline>,
+    replay: Arc<dyn registry_platform_replay::ReplayStore>,
+    metrics: Arc<AppMetrics>,
+) -> Result<Option<Arc<crate::federation::FederationRuntimeState>>, StandaloneServerError> {
+    if !config.federation.enabled {
+        return Ok(None);
+    }
+    let signing_keys = SigningKeyRegistry::from_config(&config.evidence)?;
+    let signing_provider = signing_keys
+        .signing_provider(config.federation.signing.signing_key.as_str())
+        .ok_or_else(|| {
+            invalid_signing_key(
+                config.federation.signing.signing_key.as_str(),
+                "active federation signing key was not built",
+            )
+        })?;
+    crate::federation::FederationRuntimeState::from_config(
+        &config.federation,
+        signing_provider,
+        audit,
+        replay,
+        metrics,
+    )
+    .map(Arc::new)
+    .map(Some)
+}
+
 pub struct NotaryRuntimeSnapshot {
     metrics: Arc<AppMetrics>,
     auth_state: Arc<AuthAuditState>,
@@ -3139,6 +3168,10 @@ impl AuthAuditState {
         *anchor
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = updated;
+    }
+
+    pub(crate) fn audit_pipeline(&self) -> AuditPipeline {
+        self.audit.clone()
     }
 }
 
