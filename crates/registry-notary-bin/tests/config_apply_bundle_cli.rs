@@ -34,6 +34,31 @@ fn apply_bundle_command(server: &MockServer) -> Command {
     command
 }
 
+fn remote_apply_bundle_command(server: &MockServer) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
+    command
+        .arg("config")
+        .arg("apply-bundle")
+        .arg("--admin-url")
+        .arg(server.uri())
+        .arg("--admin-token-env")
+        .arg("NOTARY_ADMIN_TOKEN_TEST")
+        .arg("--root-path")
+        .arg("/etc/registry-notary/tuf/metadata/1.root.json")
+        .arg("--metadata-base-url")
+        .arg("https://config.example.gov/metadata")
+        .arg("--targets-base-url")
+        .arg("https://config.example.gov/targets")
+        .arg("--datastore-dir")
+        .arg("/var/lib/registry-notary/tuf")
+        .arg("--target-name")
+        .arg("registry-notary.yaml")
+        .arg("--allow-dev-insecure-fetch-urls")
+        .env("NOTARY_ADMIN_TOKEN_TEST", "operator-token")
+        .env_remove("REGISTRY_NOTARY_CONFIG");
+    command
+}
+
 #[tokio::test]
 async fn config_apply_bundle_cli_posts_local_tuf_request_to_admin_apply() {
     let server = MockServer::start().await;
@@ -90,6 +115,66 @@ async fn config_apply_bundle_cli_posts_local_tuf_request_to_admin_apply() {
                 "target_name": "registry-notary.yaml"
             },
             "local_approval_reference": "ROOT-2026-Q2"
+        })
+    );
+}
+
+#[tokio::test]
+async fn config_apply_bundle_cli_posts_remote_tuf_request_to_admin_apply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v1/config/apply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": "accepted",
+            "bundle_id": "notary-remote-bundle"
+        })))
+        .mount(&server)
+        .await;
+
+    let output = remote_apply_bundle_command(&server)
+        .output()
+        .expect("remote apply-bundle command runs");
+
+    assert!(
+        output.status.success(),
+        "remote apply-bundle failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value =
+        serde_json::from_slice(&output.stdout).expect("apply-bundle emits server JSON");
+    assert_eq!(response["result"], "accepted");
+    assert_eq!(response["bundle_id"], "notary-remote-bundle");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method.as_str(), "POST");
+    assert_eq!(request.url.path(), "/admin/v1/config/apply");
+    assert_eq!(
+        request
+            .headers
+            .get("authorization")
+            .expect("authorization header is present")
+            .to_str()
+            .expect("authorization header is valid"),
+        "Bearer operator-token"
+    );
+    let body: Value = request.body_json().expect("request body is JSON");
+    assert_eq!(
+        body,
+        json!({
+            "tuf": {
+                "root_path": path_string("/etc/registry-notary/tuf/metadata/1.root.json"),
+                "metadata_base_url": "https://config.example.gov/metadata",
+                "targets_base_url": "https://config.example.gov/targets",
+                "datastore_dir": path_string("/var/lib/registry-notary/tuf"),
+                "target_name": "registry-notary.yaml",
+                "allow_dev_insecure_fetch_urls": true
+            }
         })
     );
 }
