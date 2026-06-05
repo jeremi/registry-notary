@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, OnceCell, Semaphore};
 
@@ -1706,14 +1706,22 @@ struct FileWatchSigningProvider {
     path: std::path::PathBuf,
     expected_public_jwk: PublicJwk,
     signer: Arc<StdMutex<LocalJwkSigner>>,
+    file_state: Arc<StdMutex<FileWatchFileState>>,
     readiness: Arc<AtomicU8>,
     algorithm: registry_platform_crypto::SigningAlgorithm,
+}
+
+#[derive(Clone, Debug)]
+struct FileWatchFileState {
+    last_modified: Option<SystemTime>,
+    metadata_missing: bool,
 }
 
 impl FileWatchSigningProvider {
     fn from_config(key_id: &str, key: &SigningKeyConfig) -> Result<Self, StandaloneServerError> {
         let path = std::path::PathBuf::from(&key.path);
         let signer = load_file_watch_jwk_signer(key_id, key, &path)?;
+        let last_modified = file_watch_key_file_modified(key_id, &path)?;
         Ok(Self {
             config_key_id: key_id.to_string(),
             key_config: key.clone(),
@@ -1721,6 +1729,10 @@ impl FileWatchSigningProvider {
             expected_public_jwk: signer.public_jwk(),
             algorithm: signer.algorithm(),
             signer: Arc::new(StdMutex::new(signer)),
+            file_state: Arc::new(StdMutex::new(FileWatchFileState {
+                last_modified: Some(last_modified),
+                metadata_missing: false,
+            })),
             readiness: Arc::new(AtomicU8::new(key_readiness_to_u8(KeyReadiness::Ready))),
         })
     }
@@ -1739,6 +1751,43 @@ impl FileWatchSigningProvider {
     }
 
     fn refresh(&self) {
+        let modified = match file_watch_key_file_modified(&self.config_key_id, &self.path) {
+            Ok(modified) => modified,
+            Err(err) => {
+                let mut state = self
+                    .file_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.metadata_missing {
+                    tracing::warn!(
+                        key_id = %self.config_key_id,
+                        kid = %self.key_config.kid,
+                        error = %err,
+                        "file_watch signing key metadata refresh failed; keeping last good signer"
+                    );
+                }
+                state.last_modified = None;
+                state.metadata_missing = true;
+                self.readiness.store(
+                    key_readiness_to_u8(KeyReadiness::Degraded),
+                    Ordering::SeqCst,
+                );
+                return;
+            }
+        };
+
+        {
+            let mut state = self
+                .file_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.metadata_missing && state.last_modified == Some(modified) {
+                return;
+            }
+            state.last_modified = Some(modified);
+            state.metadata_missing = false;
+        }
+
         match load_file_watch_jwk_signer(&self.config_key_id, &self.key_config, &self.path) {
             Ok(signer) if signer.public_jwk() == self.expected_public_jwk => {
                 *self
@@ -1748,7 +1797,24 @@ impl FileWatchSigningProvider {
                 self.readiness
                     .store(key_readiness_to_u8(KeyReadiness::Ready), Ordering::SeqCst);
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                tracing::warn!(
+                    key_id = %self.config_key_id,
+                    kid = %self.key_config.kid,
+                    "file_watch signing key reload produced a different public key; keeping last good signer"
+                );
+                self.readiness.store(
+                    key_readiness_to_u8(KeyReadiness::Degraded),
+                    Ordering::SeqCst,
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    key_id = %self.config_key_id,
+                    kid = %self.key_config.kid,
+                    error = %err,
+                    "file_watch signing key reload failed; keeping last good signer"
+                );
                 self.readiness.store(
                     key_readiness_to_u8(KeyReadiness::Degraded),
                     Ordering::SeqCst,
@@ -1792,6 +1858,15 @@ impl SigningProvider for FileWatchSigningProvider {
     fn readiness(&self) -> KeyReadiness {
         self.readiness()
     }
+}
+
+fn file_watch_key_file_modified(
+    key_id: &str,
+    path: &std::path::Path,
+) -> Result<SystemTime, StandaloneServerError> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|_| invalid_signing_key(key_id, "file_watch key file metadata could not be read"))
 }
 
 fn load_file_watch_jwk_signer(
@@ -6023,6 +6098,33 @@ mod tests {
         }
     }
 
+    fn test_file_modified(path: &std::path::Path) -> SystemTime {
+        std::fs::metadata(path)
+            .expect("test key metadata reads")
+            .modified()
+            .expect("test key modified time reads")
+    }
+
+    fn set_test_file_modified(path: &std::path::Path, modified: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("test key opens")
+            .set_modified(modified)
+            .expect("test key modified time sets");
+        assert_eq!(
+            test_file_modified(path),
+            modified,
+            "test filesystem preserved the requested modified time"
+        );
+    }
+
+    fn bump_test_file_modified(path: &std::path::Path, previous: SystemTime) -> SystemTime {
+        let modified = previous + Duration::from_secs(2);
+        set_test_file_modified(path, modified);
+        modified
+    }
+
     #[tokio::test]
     async fn file_watch_signing_key_reloads_valid_same_key_replacement_without_restart() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -6077,8 +6179,20 @@ mod tests {
             FileWatchSigningProvider::from_config("file-watch", &key).expect("provider builds");
         let payload = b"registry-notary file-watch malformed replacement";
         let old_public = provider.public_jwk();
+        let initial_modified = test_file_modified(&key_path);
 
         std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        set_test_file_modified(&key_path, initial_modified);
+        let signature = provider
+            .sign(payload)
+            .await
+            .expect("unchanged mtime keeps last good signer ready");
+        assert_eq!(provider.readiness(), KeyReadiness::Ready);
+        assert_eq!(provider.public_jwk(), old_public);
+        verify(payload, &signature, &old_public)
+            .expect("unchanged-mtime malformed replacement was not reloaded");
+
+        let malformed_modified = bump_test_file_modified(&key_path, initial_modified);
         let signature = provider
             .sign(payload)
             .await
@@ -6095,6 +6209,7 @@ mod tests {
 
         std::fs::write(&key_path, TEST_ROTATED_ISSUER_JWK)
             .expect("wrong public-key replacement writes");
+        bump_test_file_modified(&key_path, malformed_modified);
         let signature = provider
             .sign(payload)
             .await
@@ -6115,8 +6230,10 @@ mod tests {
         let provider: Arc<dyn SigningProvider> = Arc::new(provider);
 
         assert_eq!(provider.readiness(), KeyReadiness::Ready);
+        let initial_modified = test_file_modified(&key_path);
 
         std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        bump_test_file_modified(&key_path, initial_modified);
         provider
             .sign(b"registry-notary shared readiness")
             .await
@@ -6157,8 +6274,10 @@ credential_profiles:
             KeyReadiness::Ready,
             "initial file-watch key is ready"
         );
+        let initial_modified = test_file_modified(&key_path);
 
         std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        bump_test_file_modified(&key_path, initial_modified);
         let provider = registry
             .signing_provider("active-key")
             .expect("active provider exists");
