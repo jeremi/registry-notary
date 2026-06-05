@@ -23,7 +23,7 @@ use registry_notary_core::{
 };
 use registry_notary_server::config_governed::{
     parse_candidate_config, resolve_tuf_config_candidate, ConfigGovernanceContext,
-    LocalTufConfigTargetRequest, TufConfigTargetRequest,
+    LocalTufConfigTargetRequest, RemoteTufConfigTargetRequest, TufConfigTargetRequest,
 };
 use registry_notary_server::{
     compile_notary_runtime, openapi_document, standalone_router, EvidenceIssuerRegistry,
@@ -144,7 +144,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// Verify a local TUF-profile signed configuration target.
+    /// Verify a local or remote TUF-profile signed configuration target.
     VerifyBundle(ConfigVerifyBundleArgs),
 }
 
@@ -155,16 +155,25 @@ struct ConfigVerifyBundleArgs {
     root_path: PathBuf,
     /// Local TUF metadata directory.
     #[arg(long)]
-    metadata_dir: PathBuf,
+    metadata_dir: Option<PathBuf>,
     /// Local TUF targets directory.
     #[arg(long)]
-    targets_dir: PathBuf,
+    targets_dir: Option<PathBuf>,
+    /// Remote TUF metadata base URL.
+    #[arg(long)]
+    metadata_base_url: Option<String>,
+    /// Remote TUF targets base URL.
+    #[arg(long)]
+    targets_base_url: Option<String>,
     /// Persistent TUF datastore directory.
     #[arg(long)]
     datastore_dir: PathBuf,
     /// Target filename to verify.
     #[arg(long)]
     target_name: String,
+    /// Allow HTTP loopback remote TUF repositories for tests and local development.
+    #[arg(long)]
+    allow_dev_insecure_fetch_urls: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -443,14 +452,8 @@ async fn config_verify_bundle(
     config_path: &Path,
     args: ConfigVerifyBundleArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let request = tuf_config_target_request_from_cli(&args)?;
     let current_config = load_expanded_config(config_path)?;
-    let request = TufConfigTargetRequest::Local(LocalTufConfigTargetRequest {
-        root_path: args.root_path,
-        metadata_dir: args.metadata_dir,
-        targets_dir: args.targets_dir,
-        datastore_dir: args.datastore_dir,
-        target_name: args.target_name.clone(),
-    });
     let resolved = resolve_tuf_config_candidate(
         &request,
         &ConfigGovernanceContext::from_config(&current_config),
@@ -476,6 +479,67 @@ async fn config_verify_bundle(
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn tuf_config_target_request_from_cli(
+    args: &ConfigVerifyBundleArgs,
+) -> Result<TufConfigTargetRequest, io::Error> {
+    let has_local_source = args.metadata_dir.is_some() || args.targets_dir.is_some();
+    let has_remote_source = args.metadata_base_url.is_some()
+        || args.targets_base_url.is_some()
+        || args.allow_dev_insecure_fetch_urls;
+
+    if has_local_source && has_remote_source {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TUF request must choose exactly one local or remote source shape",
+        ));
+    }
+
+    if has_remote_source {
+        let metadata_base_url = args.metadata_base_url.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--metadata-base-url is required for remote TUF verification",
+            )
+        })?;
+        let targets_base_url = args.targets_base_url.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--targets-base-url is required for remote TUF verification",
+            )
+        })?;
+        return Ok(TufConfigTargetRequest::Remote(
+            RemoteTufConfigTargetRequest {
+                root_path: args.root_path.clone(),
+                metadata_base_url,
+                targets_base_url,
+                datastore_dir: args.datastore_dir.clone(),
+                target_name: args.target_name.clone(),
+                allow_dev_insecure_fetch_urls: args.allow_dev_insecure_fetch_urls,
+            },
+        ));
+    }
+
+    let metadata_dir = args.metadata_dir.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--metadata-dir is required for local TUF verification",
+        )
+    })?;
+    let targets_dir = args.targets_dir.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--targets-dir is required for local TUF verification",
+        )
+    })?;
+    Ok(TufConfigTargetRequest::Local(LocalTufConfigTargetRequest {
+        root_path: args.root_path.clone(),
+        metadata_dir,
+        targets_dir,
+        datastore_dir: args.datastore_dir.clone(),
+        target_name: args.target_name.clone(),
+    }))
 }
 
 fn required_config_path(path: Option<&Path>) -> Result<&Path, Box<dyn std::error::Error>> {
@@ -2299,17 +2363,70 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
         );
         assert_eq!(
             command.metadata_dir,
-            PathBuf::from("/etc/registry-notary/tuf/metadata")
+            Some(PathBuf::from("/etc/registry-notary/tuf/metadata"))
         );
         assert_eq!(
             command.targets_dir,
-            PathBuf::from("/etc/registry-notary/tuf/targets")
+            Some(PathBuf::from("/etc/registry-notary/tuf/targets"))
         );
         assert_eq!(
             command.datastore_dir,
             PathBuf::from("/var/lib/registry-notary/tuf")
         );
         assert_eq!(command.target_name, "registry-notary.yaml");
+        assert_eq!(command.metadata_base_url, None);
+        assert_eq!(command.targets_base_url, None);
+        assert!(!command.allow_dev_insecure_fetch_urls);
+    }
+
+    #[test]
+    fn config_verify_bundle_cli_accepts_remote_tuf_flags() {
+        let args = Args::try_parse_from([
+            "registry-notary",
+            "--config",
+            "/etc/registry-notary/current.yaml",
+            "config",
+            "verify-bundle",
+            "--root-path",
+            "/etc/registry-notary/tuf/metadata/1.root.json",
+            "--metadata-base-url",
+            "https://config.example.gov/metadata",
+            "--targets-base-url",
+            "https://config.example.gov/targets",
+            "--datastore-dir",
+            "/var/lib/registry-notary/tuf",
+            "--target-name",
+            "registry-notary.yaml",
+            "--allow-dev-insecure-fetch-urls",
+        ])
+        .expect("args parse");
+
+        let Some(Command::Config {
+            command: ConfigCommand::VerifyBundle(command),
+        }) = args.command
+        else {
+            panic!("expected config verify-bundle command");
+        };
+        assert_eq!(
+            command.root_path,
+            PathBuf::from("/etc/registry-notary/tuf/metadata/1.root.json")
+        );
+        assert_eq!(command.metadata_dir, None);
+        assert_eq!(command.targets_dir, None);
+        assert_eq!(
+            command.metadata_base_url.as_deref(),
+            Some("https://config.example.gov/metadata")
+        );
+        assert_eq!(
+            command.targets_base_url.as_deref(),
+            Some("https://config.example.gov/targets")
+        );
+        assert_eq!(
+            command.datastore_dir,
+            PathBuf::from("/var/lib/registry-notary/tuf")
+        );
+        assert_eq!(command.target_name, "registry-notary.yaml");
+        assert!(command.allow_dev_insecure_fetch_urls);
     }
 
     #[test]

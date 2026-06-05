@@ -15,6 +15,8 @@ use tough::editor::signed::PathExists;
 use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
 use tough::schema::Target;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TEST_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"#;
 const TEST_TOKEN_HASH: &str =
@@ -193,6 +195,41 @@ async fn write_signed_notary_config_tuf_fixture(
     }
 }
 
+async fn serve_signed_tuf_fixture(signed: &SignedConfigFixture) -> MockServer {
+    let server = MockServer::start().await;
+    mount_directory_files(&server, "/metadata", &signed.metadata_dir).await;
+    mount_directory_files(&server, "/targets", &signed.targets_dir).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/2.root.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn mount_directory_files(server: &MockServer, url_prefix: &str, dir: &Path) {
+    for entry in std::fs::read_dir(dir).expect("directory reads") {
+        let entry = entry.expect("directory entry reads");
+        let path_on_disk = entry.path();
+        if !path_on_disk.is_file() {
+            continue;
+        }
+        let filename = path_on_disk
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture filename is UTF-8");
+        Mock::given(method("GET"))
+            .and(path(format!("{url_prefix}/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    std::fs::read(path_on_disk).expect("generated repo file reads"),
+                ),
+            )
+            .mount(server)
+            .await;
+    }
+}
+
 fn verify_bundle_command(config_path: &Path, signed: &SignedConfigFixture) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
     command
@@ -210,6 +247,34 @@ fn verify_bundle_command(config_path: &Path, signed: &SignedConfigFixture) -> Co
         .arg(&signed.datastore_dir)
         .arg("--target-name")
         .arg(&signed.target_name)
+        .env("ISSUER_KEY", TEST_ISSUER_JWK)
+        .env("TEST_TOKEN_HASH", TEST_TOKEN_HASH)
+        .env("TEST_AUDIT_SECRET", TEST_AUDIT_SECRET);
+    command
+}
+
+fn remote_verify_bundle_command(
+    config_path: &Path,
+    signed: &SignedConfigFixture,
+    server: &MockServer,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
+    command
+        .arg("--config")
+        .arg(config_path)
+        .arg("config")
+        .arg("verify-bundle")
+        .arg("--root-path")
+        .arg(&signed.root_path)
+        .arg("--metadata-base-url")
+        .arg(format!("{}/metadata", server.uri()))
+        .arg("--targets-base-url")
+        .arg(format!("{}/targets", server.uri()))
+        .arg("--datastore-dir")
+        .arg(&signed.datastore_dir)
+        .arg("--target-name")
+        .arg(&signed.target_name)
+        .arg("--allow-dev-insecure-fetch-urls")
         .env("ISSUER_KEY", TEST_ISSUER_JWK)
         .env("TEST_TOKEN_HASH", TEST_TOKEN_HASH)
         .env("TEST_AUDIT_SECRET", TEST_AUDIT_SECRET);
@@ -248,6 +313,73 @@ async fn config_verify_bundle_cli_reports_verified_signed_bundle() {
         report["config_hash"],
         internal_config_hash(candidate_yaml.as_bytes())
     );
+}
+
+#[tokio::test]
+async fn config_verify_bundle_cli_reports_verified_remote_signed_bundle() {
+    let tmp = TempDir::new().expect("tempdir");
+    let current_config = write_config(&tmp, TUF_TARGETS_SIGNER_KID);
+    let candidate_yaml = config_yaml(&tmp, TUF_TARGETS_SIGNER_KID);
+    let current_hash = internal_config_hash(std::fs::read(&current_config).unwrap().as_slice());
+    let signed = write_signed_notary_config_tuf_fixture(&tmp, &current_hash, &candidate_yaml).await;
+    let server = serve_signed_tuf_fixture(&signed).await;
+
+    let output = remote_verify_bundle_command(&current_config, &signed, &server)
+        .output()
+        .expect("remote verify-bundle command runs");
+
+    assert!(
+        output.status.success(),
+        "remote verify-bundle failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("verify-bundle emits JSON report");
+    assert_eq!(report["result"], "verified");
+    assert_eq!(report["source"], "signed_bundle_endpoint");
+    assert_eq!(report["bundle_id"], "notary-test-bundle");
+    assert_eq!(report["stream_id"], "notary-test-stream");
+    assert_eq!(report["sequence"], 1);
+    assert_eq!(report["target_name"], signed.target_name);
+    assert_eq!(report["change_classes"], json!(["public_metadata"]));
+    assert_eq!(report["signer_kids"], json!([TUF_TARGETS_SIGNER_KID]));
+    assert_eq!(
+        report["config_hash"],
+        internal_config_hash(candidate_yaml.as_bytes())
+    );
+    assert!(!tmp.path().join("antirollback.json").exists());
+    assert!(!tmp.path().join("local-approvals.json").exists());
+}
+
+#[tokio::test]
+async fn config_verify_bundle_cli_rejects_ambiguous_local_and_remote_tuf_source() {
+    let tmp = TempDir::new().expect("tempdir");
+    let current_config = write_config(&tmp, TUF_TARGETS_SIGNER_KID);
+    let candidate_yaml = config_yaml(&tmp, TUF_TARGETS_SIGNER_KID);
+    let current_hash = internal_config_hash(std::fs::read(&current_config).unwrap().as_slice());
+    let signed = write_signed_notary_config_tuf_fixture(&tmp, &current_hash, &candidate_yaml).await;
+    let mut command = verify_bundle_command(&current_config, &signed);
+    command
+        .arg("--metadata-base-url")
+        .arg("https://config.example.gov/metadata")
+        .arg("--targets-base-url")
+        .arg("https://config.example.gov/targets");
+
+    let output = command.output().expect("verify-bundle command runs");
+
+    assert!(
+        !output.status.success(),
+        "ambiguous verify-bundle unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("TUF request must choose exactly one local or remote source shape"),
+        "stderr did not explain ambiguous TUF source:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!tmp.path().join("antirollback.json").exists());
 }
 
 #[tokio::test]
