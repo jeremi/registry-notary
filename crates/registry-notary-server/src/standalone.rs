@@ -3205,7 +3205,7 @@ impl std::fmt::Debug for ResolvedCredential {
 
 #[derive(Debug)]
 pub(crate) struct AuthAuditState {
-    authenticator: RwLock<Authenticator>,
+    authenticator: RwLock<Arc<Authenticator>>,
     audit: AuditPipeline,
     metrics: Arc<AppMetrics>,
     self_attestation_invalid_token_limiter: Option<Arc<SelfAttestationRateLimiter>>,
@@ -3293,7 +3293,7 @@ impl AuthAuditState {
             ))
         });
         Ok(Self {
-            authenticator: RwLock::new(Authenticator::from_config(config)?),
+            authenticator: RwLock::new(Arc::new(Authenticator::from_config(config)?)),
             audit,
             metrics,
             self_attestation_invalid_token_limiter,
@@ -3326,7 +3326,7 @@ impl AuthAuditState {
             subject_binding_claim,
             notary_anchor: Some(_),
             ..
-        } = &*authenticator
+        } = &**authenticator
         else {
             return Ok(None);
         };
@@ -3345,7 +3345,7 @@ impl AuthAuditState {
         let Authenticator::Oidc {
             notary_anchor: Some(anchor),
             ..
-        } = &*authenticator
+        } = &**authenticator
         else {
             return;
         };
@@ -3358,7 +3358,7 @@ impl AuthAuditState {
         *self
             .authenticator
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = updated;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(updated);
     }
 
     pub(crate) fn prepare_authenticator(
@@ -6642,14 +6642,14 @@ credential_profiles:
 
     fn auth_state(audit: AuditPipeline) -> Arc<AuthAuditState> {
         Arc::new(AuthAuditState {
-            authenticator: RwLock::new(Authenticator::Static {
+            authenticator: RwLock::new(Arc::new(Authenticator::Static {
                 api_keys: vec![ResolvedCredential {
                     id: "caseworker".to_string(),
                     fingerprint: registry_platform_authcommon::fingerprint_api_key("api-token"),
                     scopes: Vec::new(),
                 }],
                 bearer_tokens: Vec::new(),
-            }),
+            })),
             audit,
             metrics: Arc::new(AppMetrics::default()),
             self_attestation_invalid_token_limiter: None,
@@ -7809,10 +7809,10 @@ sources:
         };
         let audit = AuditPipeline::for_sink_dev_only(Arc::new(JsonlStdoutSink::new()));
         let state = Arc::new(AuthAuditState {
-            authenticator: RwLock::new(Authenticator::Static {
+            authenticator: RwLock::new(Arc::new(Authenticator::Static {
                 api_keys: Vec::new(),
                 bearer_tokens: Vec::new(),
-            }),
+            })),
             audit: audit.clone(),
             metrics: Arc::new(AppMetrics::default()),
             self_attestation_invalid_token_limiter: Some(Arc::new(
@@ -7845,14 +7845,14 @@ sources:
     #[tokio::test]
     async fn auth_state_accepts_case_insensitive_bearer_scheme() {
         let state = AuthAuditState {
-            authenticator: RwLock::new(Authenticator::Static {
+            authenticator: RwLock::new(Arc::new(Authenticator::Static {
                 api_keys: Vec::new(),
                 bearer_tokens: vec![ResolvedCredential {
                     id: "caseworker".to_string(),
                     fingerprint: registry_platform_authcommon::fingerprint_api_key("api-token"),
                     scopes: vec!["farmer_registry:evidence_verification".to_string()],
                 }],
-            }),
+            })),
             audit: AuditPipeline::for_sink_dev_only(Arc::new(JsonlStdoutSink::new())),
             metrics: Arc::new(AppMetrics::default()),
             self_attestation_invalid_token_limiter: None,

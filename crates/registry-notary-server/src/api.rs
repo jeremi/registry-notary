@@ -689,7 +689,7 @@ async fn admin_config_apply(
                     resolved_config_audit(
                         ConfigAdminAction::Apply,
                         &candidate,
-                        "accepted",
+                        "rejected",
                         ApplyReportResult::RejectedLocalApproval.as_str(),
                         false,
                         false,
