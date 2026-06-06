@@ -131,7 +131,7 @@ auth:
       fingerprint:
         provider: env
         name: TEST_EVIDENCE_API_KEY_HASH
-        commitment: sha256:c57781091f0b458a731104baaa4ae348c4eee79a60c1688a188e73822eb166d1
+        commitment: sha256:6c1874c8df397cc85277166d01625853a21afb53a4cff37e66fc108a0fc8cffb
       scopes: [farmer_registry:evidence_verification]
 audit:
   sink: file

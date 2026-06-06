@@ -76,7 +76,7 @@ auth:
       fingerprint:
         provider: env
         name: TEST_TOKEN_HASH
-        commitment: sha256:56c3f8e9f68c7acd05bcf1e5d619cb1c4e9f91efafb471a3c60675c983fe7ed6
+        commitment: sha256:a185ffbb208d5b11fc66f149bd880882de96256b0dfe5357a78b78ed13c17fed
 audit:
   sink: stdout
   hash_secret_env: TEST_AUDIT_SECRET
