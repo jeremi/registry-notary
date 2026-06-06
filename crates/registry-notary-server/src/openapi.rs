@@ -101,7 +101,7 @@ fn build_openapi_document() -> OpenApi {
             "/admin/v1/config/apply": {
                 "post": {
                     "summary": "Attempt to apply a candidate runtime config",
-                    "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
+                    "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires approval details, a locally configured rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
                     "operationId": "adminConfigApply",
                     "requestBody": config_apply_request_body_schema(),
                     "responses": {
@@ -2479,9 +2479,6 @@ fn config_apply_request_schema() -> Value {
             "break_glass_approval": {
                 "$ref": "#/components/schemas/BreakGlassApproval"
             },
-            "break_glass_rate_limit": {
-                "$ref": "#/components/schemas/BreakGlassRateLimit"
-            },
             "local_approval_reference": {
                 "type": "string",
                 "description": "Apply-only reference for a matching local approval record used by root_transition bundles."
@@ -3163,10 +3160,6 @@ mod tests {
         assert_eq!(
             request_schema["break_glass_approval"]["$ref"],
             json!("#/components/schemas/BreakGlassApproval")
-        );
-        assert_eq!(
-            request_schema["break_glass_rate_limit"]["$ref"],
-            json!("#/components/schemas/BreakGlassRateLimit")
         );
         assert_eq!(request_schema["local_approval_reference"]["type"], "string");
         assert_eq!(

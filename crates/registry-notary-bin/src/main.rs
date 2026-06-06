@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -210,6 +210,9 @@ struct ConfigApplyBundleArgs {
     /// Allow HTTP loopback remote TUF repositories for tests and local development.
     #[arg(long)]
     allow_dev_insecure_fetch_urls: bool,
+    /// Allow plaintext HTTP for the admin apply URL in local development.
+    #[arg(long)]
+    allow_insecure_admin_url: bool,
     /// Apply-only reference for a matching local root-transition approval record.
     #[arg(long)]
     local_approval_reference: Option<String>,
@@ -528,7 +531,7 @@ async fn config_apply_bundle(
     args: ConfigApplyBundleArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token = admin_bearer_token_from_env(&args.admin_token_env)?;
-    let url = admin_config_apply_url(&args.admin_url)?;
+    let url = admin_config_apply_url(&args.admin_url, args.allow_insecure_admin_url)?;
     let body = config_apply_bundle_request_body(&args)?;
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -578,7 +581,10 @@ fn admin_bearer_token_from_env(env_name: &str) -> Result<String, io::Error> {
     Ok(token.to_string())
 }
 
-fn admin_config_apply_url(admin_url: &str) -> Result<reqwest::Url, io::Error> {
+fn admin_config_apply_url(
+    admin_url: &str,
+    allow_insecure_admin_url: bool,
+) -> Result<reqwest::Url, io::Error> {
     let admin_url = admin_url.trim();
     if admin_url.is_empty() {
         return Err(io::Error::new(
@@ -587,11 +593,36 @@ fn admin_config_apply_url(admin_url: &str) -> Result<reqwest::Url, io::Error> {
         ));
     }
     let url = format!("{}/admin/v1/config/apply", admin_url.trim_end_matches('/'));
-    reqwest::Url::parse(&url).map_err(|err| {
+    let url = reqwest::Url::parse(&url).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("--admin-url did not form a valid admin apply URL: {err}"),
         )
+    })?;
+    if url.scheme() == "http" {
+        if !allow_insecure_admin_url {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--admin-url must use https unless --allow-insecure-admin-url is set for local development",
+            ));
+        }
+        if !is_loopback_admin_url(&url) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--allow-insecure-admin-url only permits http admin URLs on localhost or loopback addresses",
+            ));
+        }
+    }
+    Ok(url)
+}
+
+fn is_loopback_admin_url(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .map(|addr| addr.is_loopback())
+                .unwrap_or(false)
     })
 }
 
@@ -1848,7 +1879,7 @@ fn redact_value(value: &mut Value) {
         Value::Object(map) => {
             for (key, value) in map {
                 let lower = key.to_ascii_lowercase();
-                if ["secret", "token", "jwk", "pin"]
+                if ["secret", "token", "jwk", "pin", "password"]
                     .iter()
                     .any(|term| lower.contains(term))
                     || (lower.contains("key") && lower != "signing_keys" && lower != "api_keys")
@@ -2703,7 +2734,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
             "config",
             "apply-bundle",
             "--admin-url",
-            "http://127.0.0.1:8080",
+            "https://notary-admin.example.gov",
             "--admin-token-env",
             "REGISTRY_NOTARY_ADMIN_TOKEN",
             "--root-path",
@@ -2737,6 +2768,65 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
             Some("https://config.example.gov/targets")
         );
         assert!(command.allow_dev_insecure_fetch_urls);
+        assert!(!command.allow_insecure_admin_url);
+    }
+
+    #[test]
+    fn config_apply_bundle_cli_parses_insecure_admin_url_dev_opt_in() {
+        let args = Args::try_parse_from([
+            "registry-notary",
+            "config",
+            "apply-bundle",
+            "--admin-url",
+            "http://127.0.0.1:8080",
+            "--allow-insecure-admin-url",
+            "--admin-token-env",
+            "REGISTRY_NOTARY_ADMIN_TOKEN",
+            "--root-path",
+            "/etc/registry-notary/tuf/metadata/1.root.json",
+            "--metadata-dir",
+            "/etc/registry-notary/tuf/metadata",
+            "--targets-dir",
+            "/etc/registry-notary/tuf/targets",
+            "--datastore-dir",
+            "/var/lib/registry-notary/tuf",
+            "--target-name",
+            "registry-notary.yaml",
+        ])
+        .expect("args parse");
+
+        let Some(Command::Config {
+            command: ConfigCommand::ApplyBundle(command),
+        }) = args.command
+        else {
+            panic!("expected config apply-bundle command");
+        };
+        assert_eq!(command.admin_url, "http://127.0.0.1:8080");
+        assert!(command.allow_insecure_admin_url);
+    }
+
+    #[test]
+    fn admin_apply_url_rejects_remote_plaintext_even_with_dev_opt_in() {
+        let error = admin_config_apply_url("http://notary-admin.example.gov", true)
+            .expect_err("remote plaintext admin URL must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("localhost or loopback addresses"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_apply_url_accepts_loopback_plaintext_only_with_dev_opt_in() {
+        let error = admin_config_apply_url("http://127.0.0.1:8080", false)
+            .expect_err("loopback plaintext still requires explicit opt-in");
+        assert!(error.to_string().contains("--allow-insecure-admin-url"));
+
+        let url = admin_config_apply_url("http://localhost:8080", true)
+            .expect("localhost plaintext is allowed with explicit opt-in");
+        assert_eq!(url.as_str(), "http://localhost:8080/admin/v1/config/apply");
     }
 
     #[test]
@@ -2752,6 +2842,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
             datastore_dir: PathBuf::from("/var/lib/registry-notary/tuf"),
             target_name: "registry-notary.yaml".to_string(),
             allow_dev_insecure_fetch_urls: false,
+            allow_insecure_admin_url: false,
             local_approval_reference: Some("ROOT-2026-Q2".to_string()),
         };
 
@@ -2785,6 +2876,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
             datastore_dir: PathBuf::from("/var/lib/registry-notary/tuf"),
             target_name: "registry-notary.yaml".to_string(),
             allow_dev_insecure_fetch_urls: true,
+            allow_insecure_admin_url: false,
             local_approval_reference: None,
         };
 
@@ -2950,6 +3042,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
     fn redaction_covers_pin_key_and_credential_names() {
         let mut value = json!({
             "pin": "1234",
+            "password_env": "PKCS12_PASSWORD_ENV_NAME",
             "key": "plain-key",
             "credential": "raw-credential",
             "credential_env": "SOURCE_CREDENTIAL",
@@ -2973,6 +3066,7 @@ ESCAPED="client \"quoted\" value" # comment with "quote"
         redact_value(&mut value);
 
         assert_eq!(value["pin"], json!("[redacted]"));
+        assert_eq!(value["password_env"], json!("[redacted]"));
         assert_eq!(value["key"], json!("[redacted]"));
         assert_eq!(value["credential"], json!("[redacted]"));
         assert_eq!(value["credential_env"], json!("[redacted]"));

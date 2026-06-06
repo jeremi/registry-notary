@@ -74,6 +74,7 @@ use crate::{
 };
 
 const SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const FILE_WATCH_METADATA_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_SOURCE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_INBOUND_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const SELF_ATTESTATION_CORS_METHODS: &str = "GET,POST,OPTIONS";
@@ -1714,6 +1715,7 @@ struct FileWatchSigningProvider {
 #[derive(Clone, Debug)]
 struct FileWatchFileState {
     last_modified: Option<SystemTime>,
+    last_checked: Instant,
     metadata_missing: bool,
 }
 
@@ -1731,6 +1733,7 @@ impl FileWatchSigningProvider {
             signer: Arc::new(StdMutex::new(signer)),
             file_state: Arc::new(StdMutex::new(FileWatchFileState {
                 last_modified: Some(last_modified),
+                last_checked: Instant::now(),
                 metadata_missing: false,
             })),
             readiness: Arc::new(AtomicU8::new(key_readiness_to_u8(KeyReadiness::Ready))),
@@ -1751,6 +1754,18 @@ impl FileWatchSigningProvider {
     }
 
     fn refresh(&self) {
+        let now = Instant::now();
+        {
+            let mut state = self
+                .file_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if now.duration_since(state.last_checked) < FILE_WATCH_METADATA_CHECK_INTERVAL {
+                return;
+            }
+            state.last_checked = now;
+        }
+
         let modified = match file_watch_key_file_modified(&self.config_key_id, &self.path) {
             Ok(modified) => modified,
             Err(err) => {
@@ -6125,6 +6140,10 @@ mod tests {
         modified
     }
 
+    async fn wait_for_file_watch_metadata_check() {
+        tokio::time::sleep(FILE_WATCH_METADATA_CHECK_INTERVAL + Duration::from_millis(25)).await;
+    }
+
     #[tokio::test]
     async fn file_watch_signing_key_reloads_valid_same_key_replacement_without_restart() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -6140,6 +6159,7 @@ mod tests {
         verify(payload, &old_signature, &old_public).expect("old signature verifies");
 
         std::fs::write(&key_path, TEST_ISSUER_JWK_WITH_KID).expect("replacement key writes");
+        wait_for_file_watch_metadata_check().await;
         let replacement_signature = provider
             .sign(payload)
             .await
@@ -6151,6 +6171,45 @@ mod tests {
         assert_eq!(provider.readiness(), KeyReadiness::Ready);
         verify(payload, &replacement_signature, &replacement_public)
             .expect("replacement signature verifies");
+    }
+
+    #[tokio::test]
+    async fn file_watch_signing_key_debounces_metadata_checks_between_signatures() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key_path = tmp.path().join("issuer.jwk");
+        std::fs::write(&key_path, TEST_ISSUER_JWK).expect("initial key writes");
+        let key = file_watch_key(&key_path);
+        let provider =
+            FileWatchSigningProvider::from_config("file-watch", &key).expect("provider builds");
+        let payload = b"registry-notary file-watch debounce";
+        let old_public = provider.public_jwk();
+        let initial_modified = test_file_modified(&key_path);
+
+        wait_for_file_watch_metadata_check().await;
+        assert_eq!(provider.readiness(), KeyReadiness::Ready);
+
+        std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
+        bump_test_file_modified(&key_path, initial_modified);
+        let immediate_signature = provider
+            .sign(payload)
+            .await
+            .expect("debounced signer still signs");
+        assert_eq!(
+            provider.readiness(),
+            KeyReadiness::Ready,
+            "metadata is not checked again during the debounce interval"
+        );
+        verify(payload, &immediate_signature, &old_public)
+            .expect("debounced signature still verifies with the last good key");
+
+        wait_for_file_watch_metadata_check().await;
+        let delayed_signature = provider
+            .sign(payload)
+            .await
+            .expect("last good signer still signs after refresh failure");
+        assert_eq!(provider.readiness(), KeyReadiness::Degraded);
+        verify(payload, &delayed_signature, &old_public)
+            .expect("last good signature verifies after refresh failure");
     }
 
     #[test]
@@ -6193,6 +6252,7 @@ mod tests {
             .expect("unchanged-mtime malformed replacement was not reloaded");
 
         let malformed_modified = bump_test_file_modified(&key_path, initial_modified);
+        wait_for_file_watch_metadata_check().await;
         let signature = provider
             .sign(payload)
             .await
@@ -6210,6 +6270,7 @@ mod tests {
         std::fs::write(&key_path, TEST_ROTATED_ISSUER_JWK)
             .expect("wrong public-key replacement writes");
         bump_test_file_modified(&key_path, malformed_modified);
+        wait_for_file_watch_metadata_check().await;
         let signature = provider
             .sign(payload)
             .await
@@ -6234,6 +6295,7 @@ mod tests {
 
         std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
         bump_test_file_modified(&key_path, initial_modified);
+        wait_for_file_watch_metadata_check().await;
         provider
             .sign(b"registry-notary shared readiness")
             .await
@@ -6278,6 +6340,7 @@ credential_profiles:
 
         std::fs::write(&key_path, "{ not valid jwk").expect("malformed replacement writes");
         bump_test_file_modified(&key_path, initial_modified);
+        wait_for_file_watch_metadata_check().await;
         let provider = registry
             .signing_provider("active-key")
             .expect("active provider exists");

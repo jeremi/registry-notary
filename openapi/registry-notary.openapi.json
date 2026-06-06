@@ -341,7 +341,7 @@
     "/admin/v1/config/apply": {
       "post": {
         "summary": "Attempt to apply a candidate runtime config",
-        "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires local approval details, a rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
+        "description": "Standalone mode validates an inline candidate config or verifies a local or remote signed TUF config target. Governed signed credential issuer key rotations can swap the issuer runtime after anti-rollback acceptance. Break-glass apply additionally requires approval details, a locally configured rate-limit policy, and a signed emergency change class. Other changes remain restart-required.",
         "operationId": "adminConfigApply",
         "requestBody": {
           "content": {
@@ -2995,9 +2995,6 @@
           },
           "break_glass_approval": {
             "$ref": "#/components/schemas/BreakGlassApproval"
-          },
-          "break_glass_rate_limit": {
-            "$ref": "#/components/schemas/BreakGlassRateLimit"
           },
           "bundle_id": {
             "type": "string",

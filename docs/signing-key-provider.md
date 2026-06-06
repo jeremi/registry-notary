@@ -39,6 +39,7 @@ public-key inputs and never emitted.
 | --- | --- | --- | --- |
 | `local_jwk_env` | `active` | `private_jwk_env`, `alg`, `kid` | PKCS#11 and PKCS#12 fields |
 | `local_jwk_env` | `publish_only` | `public_jwk_env`, `alg`, `kid` | `private_jwk_env`, PKCS#11 and PKCS#12 fields |
+| `file_watch` | `active` | `path`, `alg`, `kid` | env-backed JWK, PKCS#11, and PKCS#12 fields |
 | `pkcs11` | `active` | `module_path`, `token_label`, `pin_env`, `key_label`, `key_id_hex`, `public_jwk_env`, `alg`, `kid` | local JWK and PKCS#12 fields |
 | `pkcs11` | `publish_only` | `public_jwk_env`, `alg`, `kid` | HSM lookup fields, local JWK and PKCS#12 fields |
 | `local_pkcs12_file` | any | none | all runtime use is rejected |

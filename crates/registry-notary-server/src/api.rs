@@ -501,6 +501,7 @@ async fn admin_config_apply(
             )
         }
     };
+    let config_governance = state.config_governance();
     let break_glass = match break_glass_proposal(&request) {
         Ok(break_glass) => break_glass,
         Err(()) => {
@@ -692,6 +693,25 @@ async fn admin_config_apply(
                 );
             }
         };
+        if !credential_issuer_rotation_ready(&issuer_rotation) {
+            consume_apply_metadata(&request);
+            return config_apply_report(
+                candidate.bundle_id.clone(),
+                candidate.sequence,
+                ApplyReportResult::RejectedReadiness,
+                false,
+                false,
+                StatusCode::CONFLICT,
+                resolved_config_audit(
+                    ConfigAdminAction::Apply,
+                    &candidate,
+                    "rejected",
+                    ApplyReportResult::RejectedReadiness.as_str(),
+                    false,
+                    false,
+                ),
+            );
+        }
         let notary_auth_anchor = match state.notary_auth_anchor_for_config(&candidate_config) {
             Ok(anchor) => anchor,
             Err(_) => {
@@ -719,7 +739,6 @@ async fn admin_config_apply(
         }
     };
     let candidate_config = Arc::new(candidate_config);
-    let config_governance = state.config_governance();
     let Some(config_trust) = &config_governance.config_trust else {
         return with_config_audit(
             config_apply_unavailable("config_trust.antirollback_state_path is not configured"),
@@ -733,7 +752,12 @@ async fn admin_config_apply(
             ),
         );
     };
-    let antirollback_store = FileAntiRollbackStore::new(&config_trust.antirollback_state_path);
+    let break_glass_rate_limit = BreakGlassRateLimit {
+        max_accepted: config_trust.break_glass_rate_limit.max_accepted,
+        window_seconds: config_trust.break_glass_rate_limit.window_seconds,
+    };
+    let antirollback_store = FileAntiRollbackStore::new(&config_trust.antirollback_state_path)
+        .with_break_glass_rate_limit(break_glass_rate_limit);
     let local_approval = governed_apply.local_approval().cloned();
     if let Err(error) = antirollback_store.accept(
         &antirollback_key(&config_governance, &candidate.stream_id),
@@ -742,26 +766,20 @@ async fn admin_config_apply(
             previous_config_hash: candidate.previous_config_hash.clone(),
             config_hash: internal_config_hash(candidate.config_yaml.as_bytes()),
             root_version: candidate.root_version,
-            break_glass: break_glass.0,
-            break_glass_rate_limit: break_glass.1,
+            break_glass,
+            break_glass_rate_limit: None,
             local_approval: local_approval.clone(),
             local_approval_rate_limit: local_approval.as_ref().map(|approval| approval.rate_limit),
         },
     ) {
-        let result = if is_break_glass_error(&error) {
-            ApplyReportResult::RejectedBreakGlass
-        } else if is_local_approval_error(&error) {
-            ApplyReportResult::RejectedLocalApproval
-        } else {
-            ApplyReportResult::RejectedRollback
-        };
+        let (result, status) = antirollback_apply_failure(&error);
         return config_apply_report(
             candidate.bundle_id.clone(),
             candidate.sequence,
             result,
             false,
             false,
-            StatusCode::CONFLICT,
+            status,
             resolved_config_audit(
                 ConfigAdminAction::Apply,
                 &candidate,
@@ -843,22 +861,20 @@ fn signing_change_authorization(candidate: &ResolvedConfigCandidate) -> SigningC
     }
 }
 
-fn break_glass_proposal(
-    request: &ConfigApplyRequest,
-) -> Result<(Option<BreakGlassApproval>, Option<BreakGlassRateLimit>), ()> {
+fn break_glass_proposal(request: &ConfigApplyRequest) -> Result<Option<BreakGlassApproval>, ()> {
     if !request.break_glass {
         return if request.break_glass_approval.is_some() || request.break_glass_rate_limit.is_some()
         {
             Err(())
         } else {
-            Ok((None, None))
+            Ok(None)
         };
     }
-    match (
-        request.break_glass_approval.clone(),
-        request.break_glass_rate_limit,
-    ) {
-        (Some(approval), Some(rate_limit)) => Ok((Some(approval), Some(rate_limit))),
+    if request.break_glass_rate_limit.is_some() {
+        return Err(());
+    }
+    match request.break_glass_approval.clone() {
+        Some(approval) => Ok(Some(approval)),
         _ => Err(()),
     }
 }
@@ -878,6 +894,10 @@ fn require_break_glass_emergency_change_class(
     } else {
         Err(())
     }
+}
+
+fn credential_issuer_rotation_ready(rotation: &CredentialIssuerRotation) -> bool {
+    rotation.signer_readiness.is_ready()
 }
 
 fn is_break_glass_error(error: &AntiRollbackStoreError) -> bool {
@@ -900,6 +920,35 @@ fn is_local_approval_error(error: &AntiRollbackStoreError) -> bool {
             | AntiRollbackStoreError::LocalApprovalRateLimited
             | AntiRollbackStoreError::InvalidLocalApproval(_)
     )
+}
+
+fn is_antirollback_state_error(error: &AntiRollbackStoreError) -> bool {
+    matches!(
+        error,
+        AntiRollbackStoreError::MissingState
+            | AntiRollbackStoreError::KeyMismatch
+            | AntiRollbackStoreError::InvalidState(_)
+            | AntiRollbackStoreError::Io(_)
+            | AntiRollbackStoreError::Json(_)
+    )
+}
+
+fn antirollback_apply_failure(error: &AntiRollbackStoreError) -> (ApplyReportResult, StatusCode) {
+    if is_break_glass_error(error) {
+        (ApplyReportResult::RejectedBreakGlass, StatusCode::CONFLICT)
+    } else if is_local_approval_error(error) {
+        (
+            ApplyReportResult::RejectedLocalApproval,
+            StatusCode::CONFLICT,
+        )
+    } else if is_antirollback_state_error(error) {
+        (
+            ApplyReportResult::InternalError,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    } else {
+        (ApplyReportResult::RejectedRollback, StatusCode::CONFLICT)
+    }
 }
 
 fn require_admin_scope_error(principal: Option<Extension<EvidencePrincipal>>) -> Option<Response> {
@@ -969,6 +1018,7 @@ fn classify_root_transition(
     };
     if current_trust.antirollback_state_path != candidate_trust.antirollback_state_path
         || current_trust.local_approval_state_path != candidate_trust.local_approval_state_path
+        || current_trust.break_glass_rate_limit != candidate_trust.break_glass_rate_limit
         || candidate_trust.accepted_roots.is_empty()
         || current_trust.accepted_roots == candidate_trust.accepted_roots
         || !root_ids_are_unique(&current_trust.accepted_roots)
@@ -7210,6 +7260,53 @@ mod tests {
             request.is_err(),
             "TUF request must choose exactly one local or remote source shape"
         );
+    }
+
+    #[test]
+    fn antirollback_state_failures_map_to_internal_error_not_rollback() {
+        for error in [
+            AntiRollbackStoreError::MissingState,
+            AntiRollbackStoreError::KeyMismatch,
+            AntiRollbackStoreError::InvalidState("corrupt hash".to_string()),
+            AntiRollbackStoreError::Io("permission denied".to_string()),
+            AntiRollbackStoreError::Json("invalid JSON".to_string()),
+        ] {
+            let (result, status) = antirollback_apply_failure(&error);
+            assert_eq!(result, ApplyReportResult::InternalError);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn genuine_rollback_failures_still_map_to_rejected_rollback() {
+        for error in [
+            AntiRollbackStoreError::NonMonotonicSequence,
+            AntiRollbackStoreError::RootVersionRollback,
+            AntiRollbackStoreError::PreviousConfigHashMismatch,
+        ] {
+            let (result, status) = antirollback_apply_failure(&error);
+            assert_eq!(result, ApplyReportResult::RejectedRollback);
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn credential_issuer_rotation_gate_rejects_unready_signer() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let not_ready = Arc::new(AtomicBool::new(false));
+        let rotation = CredentialIssuerRotation {
+            issuers: Arc::new(NoopIssuerResolver),
+            signer_readiness: SignerReadiness::from_provider_flags(vec![
+                Arc::clone(&ready),
+                Arc::clone(&not_ready),
+            ]),
+            preauth: None,
+            federation: None,
+        };
+
+        assert!(!credential_issuer_rotation_ready(&rotation));
+        not_ready.store(true, Ordering::SeqCst);
+        assert!(credential_issuer_rotation_ready(&rotation));
     }
 
     fn holder_did_jwk() -> String {

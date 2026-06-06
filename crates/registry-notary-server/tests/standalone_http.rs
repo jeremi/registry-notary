@@ -18,9 +18,10 @@ use chrono::Utc;
 #[cfg(feature = "registry-notary-cel")]
 use registry_notary_core::FEDERATION_RESPONSE_JWT_TYP;
 use registry_notary_core::{
-    BulkMode, ConfigTrustConfig, EvidenceCredentialConfig, EvidenceOidcAuthConfig, Oid4vciConfig,
-    SelfAttestationClaimSource, SigningKeyConfig, SigningKeyProviderConfig, SigningKeyStatus,
-    StandaloneRegistryNotaryConfig, SD_JWT_VC_SIGNING_ALG,
+    BulkMode, ConfigTrustConfig, ConfigTrustRateLimit, EvidenceCredentialConfig,
+    EvidenceOidcAuthConfig, Oid4vciConfig, SelfAttestationClaimSource, SigningKeyConfig,
+    SigningKeyProviderConfig, SigningKeyStatus, StandaloneRegistryNotaryConfig,
+    SD_JWT_VC_SIGNING_ALG,
 };
 #[cfg(feature = "registry-notary-cel")]
 use registry_notary_server::cel_worker::{CelWorker, CelWorkerConfig};
@@ -372,6 +373,10 @@ fn add_config_trust_with_local_approval_path(
     config.config_trust = Some(ConfigTrustConfig {
         antirollback_state_path: antirollback_path,
         local_approval_state_path: local_approval_path,
+        break_glass_rate_limit: ConfigTrustRateLimit {
+            max_accepted: 1,
+            window_seconds: 3600,
+        },
         accepted_roots: vec![RegistryTrustRoot {
             root_id: "ops-root".to_string(),
             production: false,
@@ -4820,7 +4825,6 @@ async fn admin_config_apply_signed_break_glass_issuer_rotation_swaps_without_res
         signed_tuf_apply_request(&missing_emergency_class_signed);
     missing_emergency_class_request["break_glass"] = json!(true);
     missing_emergency_class_request["break_glass_approval"] = break_glass_approval();
-    missing_emergency_class_request["break_glass_rate_limit"] = break_glass_rate_limit();
     let response = server
         .post("/admin/v1/config/apply")
         .add_header("authorization", authorization.clone())
@@ -4842,10 +4846,34 @@ async fn admin_config_apply_signed_break_glass_issuer_rotation_swaps_without_res
     assert_eq!(record.last_sequence, 1);
     assert!(record.break_glass.accepted.is_empty());
 
+    let mut client_rate_limit_request = signed_tuf_apply_request(&signed);
+    client_rate_limit_request["break_glass"] = json!(true);
+    client_rate_limit_request["break_glass_approval"] = break_glass_approval();
+    client_rate_limit_request["break_glass_rate_limit"] = break_glass_rate_limit();
+    let response = server
+        .post("/admin/v1/config/apply")
+        .add_header("authorization", authorization.clone())
+        .json(&client_rate_limit_request)
+        .await;
+
+    response.assert_status(StatusCode::CONFLICT);
+    let body: Value = response.json();
+    assert_eq!(body["result"], "rejected_break_glass");
+    assert_eq!(body["applied"], false);
+    let record = FileAntiRollbackStore::new(&antirollback_path)
+        .load(&AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "registry-notary-standalone".to_string(),
+            environment: "development".to_string(),
+            stream_id: "notary-test-stream".to_string(),
+        })
+        .expect("anti-rollback state loads");
+    assert_eq!(record.last_sequence, 1);
+    assert!(record.break_glass.accepted.is_empty());
+
     let mut request = signed_tuf_apply_request(&signed);
     request["break_glass"] = json!(true);
     request["break_glass_approval"] = break_glass_approval();
-    request["break_glass_rate_limit"] = break_glass_rate_limit();
     let response = server
         .post("/admin/v1/config/apply")
         .add_header("authorization", authorization.clone())
@@ -4993,10 +5021,10 @@ async fn admin_config_apply_signed_credential_issuer_rotation_requires_antirollb
         .json(&signed_tuf_apply_request(&signed))
         .await;
 
-    response.assert_status(StatusCode::CONFLICT);
+    response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
     let body: Value = response.json();
-    assert_eq!(body["result"], "rejected_rollback");
-    assert_eq!(body["posture_result"], "rejected");
+    assert_eq!(body["result"], "internal_error");
+    assert_eq!(body["posture_result"], "failed");
     assert_eq!(body["applied"], false);
 
     idp.stop().await;

@@ -81,8 +81,31 @@ pub struct NotaryInstanceConfig {
 pub struct ConfigTrustConfig {
     pub antirollback_state_path: PathBuf,
     pub local_approval_state_path: PathBuf,
+    #[serde(
+        default = "default_break_glass_rate_limit",
+        skip_serializing_if = "config_trust_rate_limit_is_default"
+    )]
+    pub break_glass_rate_limit: ConfigTrustRateLimit,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_roots: Vec<RegistryTrustRoot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigTrustRateLimit {
+    pub max_accepted: u32,
+    pub window_seconds: u64,
+}
+
+fn default_break_glass_rate_limit() -> ConfigTrustRateLimit {
+    ConfigTrustRateLimit {
+        max_accepted: 1,
+        window_seconds: 3600,
+    }
+}
+
+fn config_trust_rate_limit_is_default(rate_limit: &ConfigTrustRateLimit) -> bool {
+    rate_limit == &default_break_glass_rate_limit()
 }
 
 impl Default for NotaryInstanceConfig {
@@ -127,6 +150,19 @@ impl StandaloneRegistryNotaryConfig {
             {
                 return Err(EvidenceConfigError::InvalidConfigTrustConfig {
                     reason: "config_trust.local_approval_state_path must not be empty".to_string(),
+                });
+            }
+            if config_trust.break_glass_rate_limit.max_accepted == 0 {
+                return Err(EvidenceConfigError::InvalidConfigTrustConfig {
+                    reason:
+                        "config_trust.break_glass_rate_limit.max_accepted must be greater than zero"
+                            .to_string(),
+                });
+            }
+            if config_trust.break_glass_rate_limit.window_seconds == 0 {
+                return Err(EvidenceConfigError::InvalidConfigTrustConfig {
+                    reason: "config_trust.break_glass_rate_limit.window_seconds must be greater than zero"
+                        .to_string(),
                 });
             }
             for root in &config_trust.accepted_roots {
@@ -4795,6 +4831,7 @@ rule:
             local_approval_state_path: PathBuf::from(
                 "/var/lib/registry-notary/config-local-approvals.json",
             ),
+            break_glass_rate_limit: default_break_glass_rate_limit(),
             accepted_roots: Vec::new(),
         });
         let error = config
@@ -4810,6 +4847,7 @@ rule:
                 "/var/lib/registry-notary/config-antirollback.json",
             ),
             local_approval_state_path: PathBuf::from(""),
+            break_glass_rate_limit: default_break_glass_rate_limit(),
             accepted_roots: Vec::new(),
         });
         let error = config
@@ -4827,6 +4865,7 @@ rule:
             local_approval_state_path: PathBuf::from(
                 "/var/lib/registry-notary/config-local-approvals.json",
             ),
+            break_glass_rate_limit: default_break_glass_rate_limit(),
             accepted_roots: Vec::new(),
         });
         config
@@ -4844,6 +4883,7 @@ rule:
             local_approval_state_path: PathBuf::from(
                 "/var/lib/registry-notary/config-local-approvals.json",
             ),
+            break_glass_rate_limit: default_break_glass_rate_limit(),
             accepted_roots: vec![RegistryTrustRoot {
                 root_id: "ops-root".to_string(),
                 production: false,

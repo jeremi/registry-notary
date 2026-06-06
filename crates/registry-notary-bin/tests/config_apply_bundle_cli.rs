@@ -57,6 +57,7 @@ fn apply_bundle_command(server: &MockServer) -> Command {
         .arg("apply-bundle")
         .arg("--admin-url")
         .arg(server.uri())
+        .arg("--allow-insecure-admin-url")
         .arg("--admin-token-env")
         .arg("NOTARY_ADMIN_TOKEN_TEST")
         .arg("--root-path")
@@ -83,6 +84,7 @@ fn live_apply_bundle_command(server: &LiveNotaryServer, signed: &SignedConfigFix
         .arg("apply-bundle")
         .arg("--admin-url")
         .arg(&server.admin_url)
+        .arg("--allow-insecure-admin-url")
         .arg("--admin-token-env")
         .arg("NOTARY_ADMIN_TOKEN_TEST")
         .arg("--root-path")
@@ -113,6 +115,7 @@ fn remote_live_apply_bundle_command(
         .arg("apply-bundle")
         .arg("--admin-url")
         .arg(&server.admin_url)
+        .arg("--allow-insecure-admin-url")
         .arg("--admin-token-env")
         .arg("NOTARY_ADMIN_TOKEN_TEST")
         .arg("--root-path")
@@ -140,6 +143,7 @@ fn remote_apply_bundle_command(server: &MockServer) -> Command {
         .arg("apply-bundle")
         .arg("--admin-url")
         .arg(server.uri())
+        .arg("--allow-insecure-admin-url")
         .arg("--admin-token-env")
         .arg("NOTARY_ADMIN_TOKEN_TEST")
         .arg("--root-path")
@@ -525,6 +529,60 @@ async fn config_apply_bundle_cli_posts_local_tuf_request_to_admin_apply() {
             "local_approval_reference": "ROOT-2026-Q2"
         })
     );
+}
+
+#[tokio::test]
+async fn config_apply_bundle_cli_rejects_http_admin_url_without_dev_opt_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v1/config/apply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": "accepted",
+            "bundle_id": "notary-test-bundle"
+        })))
+        .mount(&server)
+        .await;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_registry-notary"));
+    command
+        .arg("config")
+        .arg("apply-bundle")
+        .arg("--admin-url")
+        .arg(server.uri())
+        .arg("--admin-token-env")
+        .arg("NOTARY_ADMIN_TOKEN_TEST")
+        .arg("--root-path")
+        .arg("/etc/registry-notary/tuf/metadata/1.root.json")
+        .arg("--metadata-dir")
+        .arg("/etc/registry-notary/tuf/metadata")
+        .arg("--targets-dir")
+        .arg("/etc/registry-notary/tuf/targets")
+        .arg("--datastore-dir")
+        .arg("/var/lib/registry-notary/tuf")
+        .arg("--target-name")
+        .arg("registry-notary.yaml")
+        .env("NOTARY_ADMIN_TOKEN_TEST", "operator-token")
+        .env_remove("REGISTRY_NOTARY_CONFIG");
+
+    let output = command
+        .output()
+        .expect("apply-bundle command runs far enough to validate URL");
+
+    assert!(
+        !output.status.success(),
+        "apply-bundle unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--allow-insecure-admin-url"),
+        "stderr did not explain the insecure admin URL opt-in:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert_eq!(requests.len(), 0);
 }
 
 #[tokio::test]

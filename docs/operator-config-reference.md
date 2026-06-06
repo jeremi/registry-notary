@@ -96,6 +96,9 @@ into the repository.
 config_trust:
   antirollback_state_path: /var/lib/registry-notary/config-antirollback.json
   local_approval_state_path: /var/lib/registry-notary/config-local-approvals.json
+  break_glass_rate_limit:
+    max_accepted: 1
+    window_seconds: 3600
   accepted_roots:
     - root_id: ops-root
       production: false
@@ -116,8 +119,10 @@ config_trust:
 `config_trust` is optional. Simple local deployments omit it and keep using the
 local YAML loaded at startup. Governed config apply requires
 `antirollback_state_path` and `local_approval_state_path`, which must point to
-durable local state such as a mounted volume. `accepted_roots` uses the shared
-Registry trust-root shape.
+durable local state such as a mounted volume. `break_glass_rate_limit` is the
+trusted local rolling-window policy for break-glass apply requests; when omitted
+it defaults to one accepted request per rate-limit identity per hour.
+`accepted_roots` uses the shared Registry trust-root shape.
 Standalone Registry Notary verifies local or remote signed TUF config targets
 against `accepted_roots` when the admin request provides a `tuf` source.
 Verified TUF targets-role signature key IDs, not target-declared custom
@@ -149,9 +154,10 @@ active signing references. Other changes continue to reject with
 anti-rollback state or change active posture provenance.
 Break-glass apply is
 available only for signed targets whose target metadata includes the local
-approval's `emergency_change_class`; the approval record, expiry, and
-rate-limit policy stay local to the admin request and are audited without the
-raw reason text.
+approval's `emergency_change_class`; the approval fields come from the admin
+request, the rolling-window policy comes from local
+`config_trust.break_glass_rate_limit`, and the audit record stores no raw reason
+text.
 
 ## Minimal Machine Config
 
