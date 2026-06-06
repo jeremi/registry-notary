@@ -128,7 +128,10 @@ auth:
   mode: api_key
   api_keys:
     - id: caseworker
-      hash_env: TEST_EVIDENCE_API_KEY_HASH
+      fingerprint:
+        provider: env
+        name: TEST_EVIDENCE_API_KEY_HASH
+        commitment: sha256:c57781091f0b458a731104baaa4ae348c4eee79a60c1688a188e73822eb166d1
       scopes: [farmer_registry:evidence_verification]
 audit:
   sink: file

@@ -73,7 +73,10 @@ auth:
   mode: api_key
   api_keys:
     - id: test-key
-      hash_env: TEST_TOKEN_HASH
+      fingerprint:
+        provider: env
+        name: TEST_TOKEN_HASH
+        commitment: sha256:56c3f8e9f68c7acd05bcf1e5d619cb1c4e9f91efafb471a3c60675c983fe7ed6
 audit:
   sink: stdout
   hash_secret_env: TEST_AUDIT_SECRET

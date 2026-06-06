@@ -224,7 +224,10 @@ auth:
   mode: api_key
   bearer_tokens:
     - id: admin-bearer
-      hash_env: TEST_ADMIN_BEARER_HASH
+      fingerprint:
+        provider: env
+        name: TEST_ADMIN_BEARER_HASH
+        commitment: sha256:bab5a326ab4a95bb3575aeb3b5674c7a4bfb9150cf292c487155948767cf8801
       scopes: [registry_notary:admin, registry_notary:ops_read]
 audit:
   sink: file
