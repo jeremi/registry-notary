@@ -13,12 +13,13 @@ use utoipa::PartialSchema;
 
 const INFO_SUMMARY: &str =
     "Standalone evidence evaluation, rendering, and credential issuance service.";
+const CONTACT_NAME: &str = "Registry Notary owning team";
 
 #[must_use]
-pub fn openapi_document() -> Value {
+pub fn openapi_document() -> &'static Value {
     static DOCUMENT: OnceLock<Value> = OnceLock::new();
 
-    DOCUMENT.get_or_init(build_openapi_document).clone()
+    DOCUMENT.get_or_init(build_openapi_document)
 }
 
 fn build_openapi_document() -> Value {
@@ -29,6 +30,9 @@ fn build_openapi_document() -> Value {
             "summary": INFO_SUMMARY,
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Standalone claim evaluation, rendering, and credential issuance API.",
+            "contact": {
+                "name": CONTACT_NAME
+            },
             "license": {
                 "name": env!("CARGO_PKG_LICENSE"),
                 "identifier": env!("CARGO_PKG_LICENSE")
@@ -899,6 +903,7 @@ fn build_openapi_document() -> Value {
         "#/components/schemas/EvaluationResponse",
     );
     document_value["info"]["summary"] = json!(INFO_SUMMARY);
+    document_value["info"]["contact"] = json!({ "name": CONTACT_NAME });
     serde_json::from_value::<OpenApi>(document_value.clone()).unwrap_or_else(|err| {
         let base_document_value =
             serde_json::to_value(&document).expect("Registry Notary OpenAPI document serializes");
@@ -3259,6 +3264,10 @@ mod tests {
         assert_eq!(
             doc["info"]["summary"],
             "Standalone evidence evaluation, rendering, and credential issuance service."
+        );
+        assert_eq!(
+            doc["info"]["contact"]["name"],
+            "Registry Notary owning team"
         );
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(doc["info"]["license"]["name"], env!("CARGO_PKG_LICENSE"));

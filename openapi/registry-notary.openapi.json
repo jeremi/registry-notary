@@ -1295,6 +1295,9 @@
     }
   },
   "info": {
+    "contact": {
+      "name": "Registry Notary owning team"
+    },
     "description": "Standalone claim evaluation, rendering, and credential issuance API.",
     "license": {
       "identifier": "Apache-2.0",
