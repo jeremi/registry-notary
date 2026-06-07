@@ -11,18 +11,22 @@ use std::sync::OnceLock;
 use utoipa::openapi::OpenApi;
 use utoipa::PartialSchema;
 
+const INFO_SUMMARY: &str =
+    "Standalone evidence evaluation, rendering, and credential issuance service.";
+
 #[must_use]
-pub fn openapi_document() -> OpenApi {
-    static DOCUMENT: OnceLock<OpenApi> = OnceLock::new();
+pub fn openapi_document() -> Value {
+    static DOCUMENT: OnceLock<Value> = OnceLock::new();
 
     DOCUMENT.get_or_init(build_openapi_document).clone()
 }
 
-fn build_openapi_document() -> OpenApi {
+fn build_openapi_document() -> Value {
     let mut raw_document = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "Registry Notary API",
+            "summary": INFO_SUMMARY,
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Standalone claim evaluation, rendering, and credential issuance API.",
             "license": {
@@ -811,7 +815,7 @@ fn build_openapi_document() -> OpenApi {
                 "apiKeyAuth": {
                     "type": "apiKey",
                     "in": "header",
-                    "name": "x-api-key"
+                    "name": "X-Api-Key"
                 },
                 "bearerAuth": {
                     "type": "http",
@@ -894,7 +898,8 @@ fn build_openapi_document() -> OpenApi {
         "200",
         "#/components/schemas/EvaluationResponse",
     );
-    serde_json::from_value(document_value.clone()).unwrap_or_else(|err| {
+    document_value["info"]["summary"] = json!(INFO_SUMMARY);
+    serde_json::from_value::<OpenApi>(document_value.clone()).unwrap_or_else(|err| {
         let base_document_value =
             serde_json::to_value(&document).expect("Registry Notary OpenAPI document serializes");
         for (name, schema) in schema_overrides {
@@ -905,7 +910,8 @@ fn build_openapi_document() -> OpenApi {
             }
         }
         panic!("Registry Notary OpenAPI schema overrides are valid: {err}");
-    })
+    });
+    document_value
 }
 
 fn add_response_examples(document: &mut Value) {
@@ -3211,7 +3217,7 @@ mod tests {
     #[test]
     fn documents_split_registry_notary_routes() {
         let doc = openapi_document();
-        let paths = doc.paths.paths;
+        let paths = doc["paths"].as_object().expect("paths object");
         for route in [
             "/healthz",
             "/ready",
@@ -3250,11 +3256,28 @@ mod tests {
     #[test]
     fn document_info_tracks_crate_metadata() {
         let doc = serde_json::to_value(openapi_document()).expect("document serializes");
+        assert_eq!(
+            doc["info"]["summary"],
+            "Standalone evidence evaluation, rendering, and credential issuance service."
+        );
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(doc["info"]["license"]["name"], env!("CARGO_PKG_LICENSE"));
         assert_eq!(
             doc["info"]["license"]["identifier"],
             env!("CARGO_PKG_LICENSE")
+        );
+    }
+
+    #[test]
+    fn document_security_contract_uses_default_security_and_canonical_api_key_header() {
+        let doc = serde_json::to_value(openapi_document()).expect("document serializes");
+        assert_eq!(
+            doc["security"],
+            json!([{ "apiKeyAuth": [] }, { "bearerAuth": [] }])
+        );
+        assert_eq!(
+            doc["components"]["securitySchemes"]["apiKeyAuth"]["name"],
+            "X-Api-Key"
         );
     }
 
