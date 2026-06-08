@@ -2577,7 +2577,7 @@ async fn openapi_json(
 }
 
 fn openapi_requires_auth_from_state(state: Option<&RegistryNotaryApiState>) -> bool {
-    state.map_or(true, RegistryNotaryApiState::openapi_requires_auth)
+    state.is_none_or(RegistryNotaryApiState::openapi_requires_auth)
 }
 
 pub trait EvidenceIssuerResolver: Send + Sync {
