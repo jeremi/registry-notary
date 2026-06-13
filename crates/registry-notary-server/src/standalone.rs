@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Standalone Registry Notary assembly, auth, audit, and HTTP source connectors.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -23,6 +23,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use jsonwebtoken::Algorithm;
+use registry_notary_core::deployment::{
+    evaluate_gates, EvaluatedFinding, EvaluatedWaiver, GateEvaluation,
+};
 use registry_notary_core::sd_jwt::EvidenceIssuer;
 use registry_notary_core::{
     AccessMode, BoundedCorrelationId, BoundedVerifiedClaims, BulkMode, DciSourceConnectionConfig,
@@ -123,12 +126,13 @@ pub fn standalone_router(
 }
 
 pub(crate) fn credential_issuer_runtime_from_config(
-    config: &EvidenceConfig,
+    config: &StandaloneRegistryNotaryConfig,
 ) -> Result<(Arc<dyn crate::api::EvidenceIssuerResolver>, SignerReadiness), StandaloneServerError> {
-    let signing_keys = SigningKeyRegistry::from_config(config)?;
+    let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+    let signing_keys = SigningKeyRegistry::from_config(&config.evidence, &reuse_scoped_key_ids)?;
     let signer_readiness = signing_keys.signer_readiness();
     let issuers = Arc::new(EvidenceIssuerRegistry::from_signing_keys(
-        config,
+        &config.evidence,
         &signing_keys,
     )?);
     Ok((issuers, signer_readiness))
@@ -138,7 +142,8 @@ pub(crate) fn preauth_runtime_from_config_preserving_stores(
     config: &StandaloneRegistryNotaryConfig,
     previous: Option<&PreAuthRuntime>,
 ) -> Result<Option<Arc<PreAuthRuntime>>, StandaloneServerError> {
-    let signing_keys = SigningKeyRegistry::from_config(&config.evidence)?;
+    let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+    let signing_keys = SigningKeyRegistry::from_config(&config.evidence, &reuse_scoped_key_ids)?;
     let audit = previous
         .map(|runtime| runtime.audit.clone())
         .map(Ok)
@@ -156,7 +161,8 @@ pub(crate) fn federation_runtime_from_config(
     if !config.federation.enabled {
         return Ok(None);
     }
-    let signing_keys = SigningKeyRegistry::from_config(&config.evidence)?;
+    let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+    let signing_keys = SigningKeyRegistry::from_config(&config.evidence, &reuse_scoped_key_ids)?;
     let signing_provider = signing_keys
         .signing_provider(config.federation.signing.signing_key.as_str())
         .ok_or_else(|| {
@@ -201,6 +207,8 @@ pub fn compile_notary_runtime(
     config: StandaloneRegistryNotaryConfig,
 ) -> Result<NotaryRuntimeSnapshot, StandaloneServerError> {
     config.validate()?;
+    let deployment_gates = DeploymentGateState::evaluate(&config);
+    deployment_gates.fail_startup_if_blocked()?;
     let federation_enabled = config.federation.enabled;
     let http_limits = NotaryHttpLimits {
         request_timeout: config.server.request_timeout,
@@ -213,12 +221,14 @@ pub fn compile_notary_runtime(
     let metrics = Arc::new(AppMetrics::default());
     let replay = ReplayStores::from_config(&config.replay)?;
     let credential_status = CredentialStatusStore::from_config(&config.credential_status)?;
-    if config.federation.enabled
-        && config.replay.storage == registry_notary_core::REPLAY_STORAGE_IN_MEMORY
-    {
+    let gate_input = config.gate_input();
+    if gate_input.replay_in_memory && gate_input.high_risk_replay_mode() {
         tracing::warn!(
-            target: "registry_notary::federation",
-            "replay store is in-memory single-instance only; do not deploy federation active-active"
+            target: "registry_notary::replay",
+            "replay store is in-memory single-instance only; a high-risk mode \
+             (federation, OID4VCI pre-authorized code, holder proof, wallet traffic, \
+             or declared multi-instance) is active. Do not run active-active without \
+             shared replay storage."
         );
     }
     let source = Arc::new(HttpEvidenceSources::from_config(
@@ -226,7 +236,11 @@ pub fn compile_notary_runtime(
         Arc::clone(&metrics),
     )?);
     let store = Arc::new(EvidenceStore::default());
-    let signing_keys = Arc::new(SigningKeyRegistry::from_config(&config.evidence)?);
+    let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+    let signing_keys = Arc::new(SigningKeyRegistry::from_config(
+        &config.evidence,
+        &reuse_scoped_key_ids,
+    )?);
     let signer_readiness = signing_keys.signer_readiness();
     let issuers = Arc::new(EvidenceIssuerRegistry::from_signing_keys(
         &config.evidence,
@@ -286,6 +300,7 @@ pub fn compile_notary_runtime(
     .with_preauth_runtime(preauth_runtime)
     .with_signer_readiness(signer_readiness)
     .with_posture_context(posture_context)
+    .with_deployment_gates(deployment_gates)
     .with_config_governance(ConfigGovernanceContext::from_config(&config))
     .with_runtime_config(Arc::new(config.clone()));
     #[cfg(feature = "registry-notary-cel")]
@@ -615,6 +630,80 @@ pub enum StandaloneServerError {
     #[cfg(feature = "registry-notary-cel")]
     #[error("invalid CEL worker configuration: {0}")]
     InvalidCelConfig(String),
+    #[error("deployment profile '{profile}' refuses startup; failing gates: {findings}")]
+    DeploymentGateStartupFailure { profile: String, findings: String },
+}
+
+/// Deployment gate evaluation result carried through runtime assembly.
+///
+/// Evaluated once at startup. `startup_fail` gates abort assembly; the rest is
+/// stored so the readiness handler and posture can report it without
+/// re-evaluating.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeploymentGateState {
+    pub(crate) profile: Option<&'static str>,
+    pub(crate) startup_failures: Vec<String>,
+    pub(crate) readiness_failures: Vec<String>,
+    pub(crate) findings: Vec<EvaluatedFinding>,
+    pub(crate) active_waivers: Vec<EvaluatedWaiver>,
+}
+
+impl DeploymentGateState {
+    pub(crate) fn evaluate(config: &StandaloneRegistryNotaryConfig) -> Self {
+        let input = config.gate_input();
+        let evaluation = evaluate_gates(
+            config.deployment.profile,
+            &input,
+            &config.deployment.waivers,
+            &today_utc_date(),
+        );
+        let GateEvaluation {
+            startup_failures,
+            readiness_failures,
+            findings,
+            active_waivers,
+        } = evaluation;
+        Self {
+            profile: config.deployment.profile.map(|profile| profile.as_str()),
+            startup_failures,
+            readiness_failures,
+            findings,
+            active_waivers,
+        }
+    }
+
+    fn fail_startup_if_blocked(&self) -> Result<(), StandaloneServerError> {
+        if self.startup_failures.is_empty() {
+            return Ok(());
+        }
+        Err(StandaloneServerError::DeploymentGateStartupFailure {
+            profile: self.profile.unwrap_or("undeclared").to_string(),
+            findings: self.startup_failures.join(", "),
+        })
+    }
+
+    /// True when a profile is declared, so its gates participate in readiness.
+    ///
+    /// An undeclared profile binds no gates and contributes no readiness check.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.profile.is_some()
+    }
+
+    /// True when at least one bound gate reports a readiness failure.
+    pub(crate) fn has_readiness_failure(&self) -> bool {
+        !self.readiness_failures.is_empty()
+    }
+}
+
+/// Today's date in UTC as a `YYYY-MM-DD` string, for waiver-expiry comparison.
+fn today_utc_date() -> String {
+    let now = OffsetDateTime::now_utc().date();
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
 }
 
 #[cfg(feature = "registry-notary-cel")]
@@ -1629,7 +1718,18 @@ pub struct EvidenceIssuerRegistry {
 
 impl EvidenceIssuerRegistry {
     pub fn from_config(config: &EvidenceConfig) -> Result<Self, StandaloneServerError> {
-        let signing_keys = SigningKeyRegistry::from_config(config)?;
+        // Without the surrounding `StandaloneRegistryNotaryConfig` this builder
+        // only sees credential-profile signing roles, so the resolved-material
+        // reuse check (#173) is confined to those here. The access-token and
+        // federation roles are checked on the real startup/apply paths
+        // (`compile_notary_runtime`, signing-key rotation), which thread the
+        // full role set through `SigningKeyRegistry::from_config`.
+        let reuse_scoped_key_ids: HashSet<&str> = config
+            .credential_profiles
+            .values()
+            .map(|profile| profile.signing_key.as_str())
+            .collect();
+        let signing_keys = SigningKeyRegistry::from_config(config, &reuse_scoped_key_ids)?;
         Self::from_signing_keys(config, &signing_keys)
     }
 
@@ -1813,17 +1913,21 @@ struct SigningKeyRegistry {
 }
 
 impl SigningKeyRegistry {
-    fn from_config(config: &EvidenceConfig) -> Result<Self, StandaloneServerError> {
+    fn from_config(
+        config: &EvidenceConfig,
+        reuse_scoped_key_ids: &HashSet<&str>,
+    ) -> Result<Self, StandaloneServerError> {
         let mut issuers = BTreeMap::new();
         let mut providers = BTreeMap::new();
         let mut public_jwks_by_kid = BTreeMap::new();
+        let mut resolved_public_jwks = Vec::new();
         #[cfg_attr(not(feature = "pkcs11"), allow(unused_mut))]
         let mut readiness_entries = Vec::new();
         for (key_id, key) in &config.signing_keys {
             if !key.status.may_publish() {
                 continue;
             }
-            let public_jwk = match key.provider {
+            let (public_jwk, public_jwk_for_validation) = match key.provider {
                 SigningKeyProviderConfig::LocalJwkEnv => {
                     if key.status.may_sign() {
                         let provider: Arc<dyn SigningProvider> =
@@ -1838,16 +1942,22 @@ impl SigningKeyRegistry {
                             invalid_signing_key(key_id, "local signer failed self-test")
                         })?;
                         let public_jwk = issuer.public_jwk();
+                        let public_jwk_for_validation = provider.public_jwk();
                         issuers.insert(key_id.clone(), issuer);
                         providers.insert(key_id.clone(), provider);
-                        public_jwk
+                        (public_jwk, public_jwk_for_validation)
                     } else {
                         readiness_entries.push(static_key_readiness(
                             key.kid.clone(),
                             false,
                             KeyReadiness::Ready,
                         ));
-                        build_public_jwk_value(key_id, key)?
+                        let public_jwk_for_validation = build_public_jwk(key_id, key)?;
+                        let public_jwk = serde_json::to_value(public_jwk_for_validation.clone())
+                            .map_err(|_| {
+                                invalid_signing_key(key_id, "public JWK could not be serialized")
+                            })?;
+                        (public_jwk, public_jwk_for_validation)
                     }
                 }
                 SigningKeyProviderConfig::Pkcs11 => {
@@ -1870,9 +1980,10 @@ impl SigningKeyRegistry {
                                         )
                                     })?;
                             let public_jwk = issuer.public_jwk();
+                            let public_jwk_for_validation = provider.public_jwk();
                             issuers.insert(key_id.clone(), issuer);
                             providers.insert(key_id.clone(), provider);
-                            public_jwk
+                            (public_jwk, public_jwk_for_validation)
                         }
                         #[cfg(not(feature = "pkcs11"))]
                         {
@@ -1886,7 +1997,12 @@ impl SigningKeyRegistry {
                             false,
                             KeyReadiness::Ready,
                         ));
-                        build_public_jwk_value(key_id, key)?
+                        let public_jwk_for_validation = build_public_jwk(key_id, key)?;
+                        let public_jwk = serde_json::to_value(public_jwk_for_validation.clone())
+                            .map_err(|_| {
+                                invalid_signing_key(key_id, "public JWK could not be serialized")
+                            })?;
+                        (public_jwk, public_jwk_for_validation)
                     }
                 }
                 SigningKeyProviderConfig::FileWatch => {
@@ -1903,9 +2019,10 @@ impl SigningKeyRegistry {
                             invalid_signing_key(key_id, "file-watch signer failed self-test")
                         })?;
                         let public_jwk = issuer.public_jwk();
+                        let public_jwk_for_validation = provider.public_jwk();
                         issuers.insert(key_id.clone(), issuer);
                         providers.insert(key_id.clone(), provider);
-                        public_jwk
+                        (public_jwk, public_jwk_for_validation)
                     } else {
                         continue;
                     }
@@ -1921,6 +2038,7 @@ impl SigningKeyRegistry {
                     });
                 }
             };
+            resolved_public_jwks.push((key_id.clone(), public_jwk_for_validation));
             public_jwks_by_kid.insert(
                 key.kid.clone(),
                 PublishedJwk {
@@ -1929,6 +2047,12 @@ impl SigningKeyRegistry {
                 },
             );
         }
+        config.validate_resolved_signing_key_material(
+            resolved_public_jwks
+                .iter()
+                .map(|(key_id, public_jwk)| (key_id.as_str(), public_jwk)),
+            reuse_scoped_key_ids,
+        )?;
         Ok(Self {
             issuers,
             providers,
@@ -2313,6 +2437,15 @@ fn build_public_jwk_value(
     key_id: &str,
     key: &SigningKeyConfig,
 ) -> Result<Value, StandaloneServerError> {
+    let public = build_public_jwk(key_id, key)?;
+    serde_json::to_value(public)
+        .map_err(|_| invalid_signing_key(key_id, "public JWK could not be serialized"))
+}
+
+fn build_public_jwk(
+    key_id: &str,
+    key: &SigningKeyConfig,
+) -> Result<PublicJwk, StandaloneServerError> {
     let raw = env::var(&key.public_jwk_env)
         .ok()
         .filter(|value| !value.is_empty())
@@ -2332,8 +2465,7 @@ fn build_public_jwk_value(
             "public JWK alg does not match configured alg",
         ));
     }
-    serde_json::to_value(public)
-        .map_err(|_| invalid_signing_key(key_id, "public JWK could not be serialized"))
+    Ok(public)
 }
 
 fn invalid_signing_key(key: &str, reason: &str) -> StandaloneServerError {
@@ -3624,6 +3756,13 @@ impl RequestCredentials {
         usize::from(self.api_key.is_some())
             + usize::from(self.authorization_present || self.bearer_token.is_some())
     }
+
+    fn are_absent(&self) -> bool {
+        self.api_key.is_none()
+            && !self.authorization_present
+            && self.bearer_token.is_none()
+            && self.id_token.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4107,7 +4246,7 @@ async fn auth_audit_middleware(
     let credentials = request_credentials(&request);
     let client_address = client_address_identifier(&request);
     if let Err(rate_error) =
-        maybe_rate_limit_invalid_token_before_auth(&state, &credentials, client_address.as_str())
+        maybe_rate_limit_auth_rejection_before_auth(&state, &credentials, client_address.as_str())
     {
         let mut response = crate::api::evidence_error_response_with_request_id(
             rate_error.evidence_error(),
@@ -4154,11 +4293,9 @@ async fn auth_audit_middleware(
     let principal = match state.authenticate(credentials.clone()).await {
         Ok(principal) => principal,
         Err(error) => {
-            if let Err(rate_error) = consume_invalid_token_after_auth_failure(
-                &state,
-                &credentials,
-                client_address.as_str(),
-            ) {
+            if let Err(rate_error) =
+                consume_auth_rejection_after_auth_failure(&state, client_address.as_str())
+            {
                 let mut response = crate::api::evidence_error_response_with_request_id(
                     rate_error.evidence_error(),
                     Some(&correlation_id),
@@ -4261,12 +4398,12 @@ fn client_address_identifier(request: &Request) -> String {
         .unwrap_or_else(|| "unknown-client-address".to_string())
 }
 
-fn maybe_rate_limit_invalid_token_before_auth(
+fn maybe_rate_limit_auth_rejection_before_auth(
     state: &AuthAuditState,
     credentials: &RequestCredentials,
     client_address: &str,
 ) -> Result<(), crate::SelfAttestationRateLimitError> {
-    if credentials.bearer_token.is_none() {
+    if credentials.bearer_token.is_none() && !credentials.are_absent() {
         return Ok(());
     }
     let (Some(limiter), Some(keys)) = (
@@ -4279,14 +4416,10 @@ fn maybe_rate_limit_invalid_token_before_auth(
     limiter.check_invalid_token_for_client_address_available(&client_address)
 }
 
-fn consume_invalid_token_after_auth_failure(
+fn consume_auth_rejection_after_auth_failure(
     state: &AuthAuditState,
-    credentials: &RequestCredentials,
     client_address: &str,
 ) -> Result<(), crate::SelfAttestationRateLimitError> {
-    if credentials.bearer_token.is_none() {
-        return Ok(());
-    }
     let (Some(limiter), Some(keys)) = (
         state.self_attestation_invalid_token_limiter.as_ref(),
         state.self_attestation_rate_keys.as_ref(),
@@ -5760,7 +5893,14 @@ async fn read_remote_openfn_sidecar_many_context(
 
 fn openfn_item_error(error: &Map<String, Value>) -> EvidenceError {
     match error.get("code").and_then(Value::as_str) {
-        Some("target_auth") | Some("target_rate_limit") => EvidenceError::SourceUnavailable,
+        Some(
+            "target_auth"
+            | "target_rate_limit"
+            | "source.target_auth"
+            | "source.target_rate_limit"
+            | "source.timeout"
+            | "source.unavailable",
+        ) => EvidenceError::SourceUnavailable,
         _ => EvidenceError::SourceUnavailable,
     }
 }
@@ -6663,6 +6803,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use axum::body::Body;
+    use axum::extract::Query;
     use axum::response::Redirect;
     use axum::routing::{get, post};
     use axum_test::TestServer;
@@ -6706,7 +6847,9 @@ mod tests {
     const OPENFN_ENVIRONMENT: &str = "staging";
     const OPENFN_STREAM_ID: &str = "openfn-sidecar-runtime";
     const OPENFN_TARGET_NAME: &str = "openfn-sidecar-runtime.json";
+    const HTTP_JSON_CREDENTIAL_ENV: &str = "TEST_HTTP_JSON_READER_CREDENTIAL_JSON";
     const TEST_AUDIT_HASH_SECRET_ENV: &str = "REGISTRY_NOTARY_TEST_AUDIT_HASH_SECRET";
+    static HTTP_JSON_SIDECAR_ENV_LOCK: Mutex<()> = Mutex::const_new(());
     const TEST_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"#;
     const TEST_ISSUER_JWK_WITH_KID: &str = r##"{"kty":"OKP","crv":"Ed25519","kid":"did:web:issuer.example#file-watch","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA"}"##;
     const TEST_ROTATED_ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"8jFBgUJxaaQimd4NjzxhvPYyNbcOnnZsqOntZbpP3Xk","x":"XvW-aWwJCWSYoYudTB9OZqNHURKElnnyGNa6DQNjzZk","alg":"EdDSA"}"#;
@@ -7111,7 +7254,13 @@ credential_profiles:
 "#
         ))
         .expect("evidence config parses");
-        let registry = SigningKeyRegistry::from_config(&evidence).expect("registry builds");
+        let reuse_scoped_key_ids: HashSet<&str> = evidence
+            .credential_profiles
+            .values()
+            .map(|profile| profile.signing_key.as_str())
+            .collect();
+        let registry = SigningKeyRegistry::from_config(&evidence, &reuse_scoped_key_ids)
+            .expect("registry builds");
         let readiness = registry.signer_readiness();
         assert_eq!(
             readiness.by_kid()[0].readiness,
@@ -7600,6 +7749,7 @@ credential_profiles:
         );
 
         let key_path = tmp.path().join("issuer-ed25519.pem");
+        let secondary_key_path = tmp.path().join("issuer-ed25519-secondary.pem");
         run_command(
             std::process::Command::new("openssl")
                 .arg("genpkey")
@@ -7607,6 +7757,14 @@ credential_profiles:
                 .arg("ED25519")
                 .arg("-out")
                 .arg(&key_path),
+        );
+        run_command(
+            std::process::Command::new("openssl")
+                .arg("genpkey")
+                .arg("-algorithm")
+                .arg("ED25519")
+                .arg("-out")
+                .arg(&secondary_key_path),
         );
         run_command(
             std::process::Command::new("softhsm2-util")
@@ -7620,6 +7778,20 @@ credential_profiles:
                 .arg("issuer-signing-key")
                 .arg("--id")
                 .arg("01ab23cd")
+                .arg("--force"),
+        );
+        run_command(
+            std::process::Command::new("softhsm2-util")
+                .arg("--import")
+                .arg(&secondary_key_path)
+                .arg("--token")
+                .arg(&token_label)
+                .arg("--pin")
+                .arg(pin)
+                .arg("--label")
+                .arg("issuer-signing-key-secondary")
+                .arg("--id")
+                .arg("02ab23cd")
                 .arg("--force"),
         );
 
@@ -7638,6 +7810,22 @@ credential_profiles:
             "Ed25519 SubjectPublicKeyInfo has key bytes"
         );
         let x = URL_SAFE_NO_PAD.encode(&public_der[public_der.len() - 32..]);
+        let secondary_public_der = command_output(
+            std::process::Command::new("openssl")
+                .arg("pkey")
+                .arg("-in")
+                .arg(&secondary_key_path)
+                .arg("-pubout")
+                .arg("-outform")
+                .arg("DER"),
+        )
+        .expect("openssl exports secondary public key");
+        assert!(
+            secondary_public_der.len() >= 32,
+            "secondary Ed25519 SubjectPublicKeyInfo has key bytes"
+        );
+        let secondary_x =
+            URL_SAFE_NO_PAD.encode(&secondary_public_der[secondary_public_der.len() - 32..]);
         let public_jwk_primary = serde_json::json!({
             "kty": "OKP",
             "crv": "Ed25519",
@@ -7649,7 +7837,7 @@ credential_profiles:
         let public_jwk_secondary = serde_json::json!({
             "kty": "OKP",
             "crv": "Ed25519",
-            "x": x,
+            "x": secondary_x,
             "alg": "EdDSA",
             "kid": "did:web:issuer.example#softhsm-secondary"
         })
@@ -7680,8 +7868,8 @@ signing_keys:
     module_path: {module_path}
     token_label: {token_label}
     pin_env: TEST_SOFTHSM_PIN
-    key_label: issuer-signing-key
-    key_id_hex: 01ab23cd
+    key_label: issuer-signing-key-secondary
+    key_id_hex: 02ab23cd
     public_jwk_env: TEST_SOFTHSM_PUBLIC_JWK_SECONDARY
     alg: EdDSA
     kid: did:web:issuer.example#softhsm-secondary
@@ -8079,11 +8267,111 @@ sources:
             .expect("sidecar test config parses")
     }
 
+    fn http_json_sidecar_test_manifest(upstream_url: &str) -> String {
+        std::env::set_var(OPENFN_SIDECAR_TOKEN_HASH_ENV, OPENFN_SIDECAR_TOKEN_HASH);
+        std::env::set_var(
+            HTTP_JSON_CREDENTIAL_ENV,
+            json!({
+                "baseUrl": upstream_url,
+                "clientId": "notary-test",
+                "apiToken": "http-json-target-token"
+            })
+            .to_string(),
+        );
+        format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+auth:
+  bearer_tokens:
+    - id: notary
+      hash_env: "{OPENFN_SIDECAR_TOKEN_HASH_ENV}"
+limits:
+  max_workers: 2
+  worker_timeout_ms: 250
+  max_output_bytes: 4096
+  max_request_bytes: 2048
+  max_query_parameter_bytes: 128
+  liveness_window_ms: 30000
+  max_batch_items: 100
+sources:
+  openfn_crvs:
+    engine: http_json
+    dataset: civil_registry
+    entity: civil_person
+    credential_env: "{HTTP_JSON_CREDENTIAL_ENV}"
+    credential_public_fields:
+      - baseUrl
+      - clientId
+    allowed_base_urls:
+      - "{upstream_url}"
+    allow_insecure_localhost: true
+    http_json:
+      method: GET
+      base_url:
+        cel: credential_public.baseUrl
+      path: "/people"
+      query:
+        id:
+          cel: lookup.value
+      headers:
+        x-client-id:
+          cel: credential_public.clientId
+      auth:
+        type: bearer
+        token:
+          secret: apiToken
+      response:
+        records:
+          cel: body.results
+    smoke_lookup:
+      field: national_id
+      value: smoke-person
+      fields:
+        - national_id
+      purpose: startup-smoke
+"#
+        )
+    }
+
     async fn fixed_openfn_batch_response_handler(
         State(response): State<Value>,
         Json(_request): Json<Value>,
     ) -> Response {
         Json(response).into_response()
+    }
+
+    async fn http_json_people_handler(
+        Query(query): Query<HashMap<String, String>>,
+        headers: HeaderMap,
+    ) -> Response {
+        let authorized = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer http-json-target-token");
+        let client_id = headers
+            .get("x-client-id")
+            .and_then(|value| value.to_str().ok());
+        if !authorized || client_id != Some("notary-test") {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let id = query.get("id").cloned().unwrap_or_default();
+        let results = match id.as_str() {
+            "person-123" | "smoke-person" => json!([
+                {
+                    "national_id": id,
+                    "birth_date": "1990-01-01",
+                    "ignored_extra": "notary must not depend on this"
+                }
+            ]),
+            _ => json!([]),
+        };
+        Json(json!({ "results": results })).into_response()
+    }
+
+    fn http_json_sidecar_test_config(upstream_url: &str) -> SidecarConfig {
+        serde_norway::from_str(&http_json_sidecar_test_manifest(upstream_url))
+            .expect("http_json sidecar test config parses")
     }
 
     async fn read_openfn_batch_from_fixed_response(
@@ -8854,6 +9142,77 @@ config_trust:
     }
 
     #[tokio::test]
+    async fn http_json_sidecar_rda_facade_can_source_single_item_attestation() {
+        let _env_guard = HTTP_JSON_SIDECAR_ENV_LOCK.lock().await;
+        std::env::set_var(OPENFN_SIDECAR_TOKEN_ENV, OPENFN_SIDECAR_TOKEN);
+        let upstream = TestServer::builder()
+            .http_transport()
+            .build(Router::new().route("/people", get(http_json_people_handler)));
+        let upstream_url = upstream
+            .server_address()
+            .expect("HTTP transport exposes upstream address")
+            .to_string()
+            .trim_end_matches('/')
+            .to_string();
+        let sidecar = sidecar_router(http_json_sidecar_test_config(&upstream_url))
+            .await
+            .expect("http_json sidecar router builds");
+        let server = TestServer::builder().http_transport().build(sidecar);
+        let evidence = Arc::new(openfn_sidecar_spike_config(
+            server
+                .server_address()
+                .expect("HTTP transport exposes sidecar address")
+                .as_str(),
+        ));
+        let source = Arc::new(
+            HttpEvidenceSources::from_config(&evidence, Arc::new(AppMetrics::default()))
+                .expect("source config"),
+        );
+        let principal = EvidencePrincipal {
+            principal_id: "caseworker".to_string(),
+            scopes: vec!["civil_registry:evidence_verification".to_string()],
+            access_mode: AccessMode::MachineClient,
+            verified_claims: None,
+        };
+
+        let results = crate::RegistryNotaryRuntime::new()
+            .evaluate(
+                Arc::clone(&evidence),
+                source,
+                &EvidenceStore::default(),
+                &principal,
+                EvaluateRequest {
+                    requester: None,
+                    target: Some(registry_notary_core::EvidenceEntity::from_subject_request(
+                        "Person",
+                        SubjectRequest {
+                            id: "person-123".to_string(),
+                            id_type: None,
+                        },
+                    )),
+                    relationship: None,
+                    on_behalf_of: None,
+                    claims: vec![registry_notary_core::ClaimRef::from("date-of-birth")],
+                    disclosure: Some("value".to_string()),
+                    format: Some(FORMAT_CLAIM_RESULT_JSON.to_string()),
+                    purpose: Some(OPENFN_SPIKE_PURPOSE.to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("http_json sidecar facade sources the claim");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].claim_id, "date-of-birth");
+        assert_eq!(results[0].value, Some(json!("1990-01-01")));
+        assert_eq!(results[0].provenance.used.source_count, 1);
+        assert!(
+            results[0].provenance.used.source_runtimes.is_empty(),
+            "unsigned local sidecar has no pinned runtime summary"
+        );
+    }
+
+    #[tokio::test]
     async fn governed_openfn_sidecar_e2e_notary_pins_assurance_and_evaluates() {
         std::env::set_var(OPENFN_SIDECAR_TOKEN_ENV, OPENFN_SIDECAR_TOKEN);
         std::env::set_var(
@@ -8954,6 +9313,119 @@ config_trust:
         assert_eq!(runtimes[0].kind, SOURCE_RUNTIME_KIND_OPENFN_SIDECAR);
         assert_eq!(runtimes[0].config_hash, repo.config_hash);
         assert!(runtimes[0].config_hash.starts_with("sha256:"));
+        assert!(runtimes[0].assurance.pinned);
+        assert!(runtimes[0].assurance.expression_hashes_verified);
+        assert!(runtimes[0].assurance.runtime_verified);
+        assert!(runtimes[0].assurance.smoke_verified);
+    }
+
+    #[tokio::test]
+    async fn governed_http_json_sidecar_e2e_notary_pins_assurance_and_evaluates() {
+        let _env_guard = HTTP_JSON_SIDECAR_ENV_LOCK.lock().await;
+        std::env::set_var(OPENFN_SIDECAR_TOKEN_ENV, OPENFN_SIDECAR_TOKEN);
+        let upstream = TestServer::builder()
+            .http_transport()
+            .build(Router::new().route("/people", get(http_json_people_handler)));
+        let upstream_url = upstream
+            .server_address()
+            .expect("HTTP transport exposes upstream address")
+            .to_string()
+            .trim_end_matches('/')
+            .to_string();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let manifest = http_json_sidecar_test_manifest(&upstream_url);
+        let target_bytes = render_governed_runtime_target_json(&manifest, tmp.path())
+            .expect("governed http_json target renders");
+        let target_json: Value =
+            serde_json::from_slice(&target_bytes).expect("target is valid JSON");
+        assert!(target_json["openfn"].is_null());
+        assert!(target_json["worker"].is_null());
+        assert!(target_json["jobs_root"].is_null());
+        assert!(target_json["limits"]["max_worker_memory_mb"].is_null());
+
+        let previous_config_hash =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let repo = signed_openfn_runtime_repo(&target_bytes, 13, previous_config_hash).await;
+        initialize_openfn_antirollback(&repo, previous_config_hash, 12);
+        let bootstrap = openfn_governed_bootstrap_yaml(&repo);
+        let sidecar_config = load_openfn_sidecar_startup_config(&bootstrap)
+            .await
+            .expect("governed http_json sidecar startup config loads");
+        let sidecar = sidecar_router(sidecar_config)
+            .await
+            .expect("governed http_json sidecar starts");
+        let server = TestServer::builder().http_transport().build(sidecar);
+
+        let ready = server.get("/ready").await;
+        ready.assert_status_ok();
+        let ready_body: Value = ready.json();
+        assert_eq!(ready_body["status"], "ready");
+        assert_eq!(ready_body["config_hash"], repo.config_hash);
+
+        let mut evidence = openfn_sidecar_spike_config(
+            server
+                .server_address()
+                .expect("HTTP transport exposes sidecar address")
+                .as_str(),
+        );
+        evidence
+            .source_connections
+            .get_mut("openfn_crvs")
+            .expect("connection exists")
+            .expected_sidecar = Some(expected_openfn_sidecar(&repo.config_hash));
+        let evidence = Arc::new(evidence);
+        let source = Arc::new(
+            HttpEvidenceSources::from_config(&evidence, Arc::new(AppMetrics::default()))
+                .expect("source config"),
+        );
+        assert!(source.check_ready().await);
+        let principal = EvidencePrincipal {
+            principal_id: "caseworker".to_string(),
+            scopes: vec!["civil_registry:evidence_verification".to_string()],
+            access_mode: AccessMode::MachineClient,
+            verified_claims: None,
+        };
+
+        let results = crate::RegistryNotaryRuntime::new()
+            .evaluate(
+                Arc::clone(&evidence),
+                source.clone(),
+                &EvidenceStore::default(),
+                &principal,
+                EvaluateRequest {
+                    requester: None,
+                    target: Some(registry_notary_core::EvidenceEntity::from_subject_request(
+                        "Person",
+                        SubjectRequest {
+                            id: "person-123".to_string(),
+                            id_type: None,
+                        },
+                    )),
+                    relationship: None,
+                    on_behalf_of: None,
+                    claims: vec![registry_notary_core::ClaimRef::from("date-of-birth")],
+                    disclosure: Some("value".to_string()),
+                    format: Some(FORMAT_CLAIM_RESULT_JSON.to_string()),
+                    purpose: Some(OPENFN_SPIKE_PURPOSE.to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("governed http_json sidecar sources the claim");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].claim_id, "date-of-birth");
+        assert_eq!(results[0].value, Some(json!("1990-01-01")));
+        assert_eq!(
+            source
+                .observed_sidecar_config_hashes(&evidence, &["date-of-birth".to_string()])
+                .await,
+            vec![repo.config_hash.clone()]
+        );
+        let runtimes = &results[0].provenance.used.source_runtimes;
+        assert_eq!(runtimes.len(), 1, "one sidecar runtime summary expected");
+        assert_eq!(runtimes[0].kind, SOURCE_RUNTIME_KIND_OPENFN_SIDECAR);
+        assert_eq!(runtimes[0].config_hash, repo.config_hash);
         assert!(runtimes[0].assurance.pinned);
         assert!(runtimes[0].assurance.expression_hashes_verified);
         assert!(runtimes[0].assurance.runtime_verified);
@@ -9156,6 +9628,46 @@ config_trust:
             .get("/ok")
             .add_header(header::AUTHORIZATION, "Bearer invalid-token")
             .await;
+        second.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = second.json();
+        assert_eq!(body["code"], json!("self_attestation.rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_are_rate_limited_when_self_attestation_is_enabled() {
+        let rate_limits = SelfAttestationRateLimitsConfig {
+            invalid_token_per_client_address_per_minute: 1,
+            per_principal_per_minute: 1,
+            subject_mismatch_per_principal_per_hour: 1,
+            per_holder_per_hour: 1,
+            credential_issuance_per_principal_per_hour: 1,
+            ..SelfAttestationRateLimitsConfig::default()
+        };
+        let audit = AuditPipeline::for_sink_dev_only(Arc::new(JsonlStdoutSink::new()));
+        let state = Arc::new(AuthAuditState {
+            authenticator: RwLock::new(Arc::new(Authenticator::Static {
+                api_keys: Vec::new(),
+                bearer_tokens: Vec::new(),
+            })),
+            audit: audit.clone(),
+            metrics: Arc::new(AppMetrics::default()),
+            openapi_requires_auth: AtomicBool::new(true),
+            self_attestation_invalid_token_limiter: Some(Arc::new(
+                SelfAttestationRateLimiter::new(rate_limits),
+            )),
+            self_attestation_rate_keys: Some(Arc::new(SelfAttestationRateLimitKeys::new(
+                audit.profile.key_hasher(),
+            ))),
+        });
+        let app = Router::new()
+            .route("/ok", get(|| async { StatusCode::OK }))
+            .layer(from_fn_with_state(state, auth_audit_middleware));
+        let server = TestServer::builder().http_transport().build(app);
+
+        let first = server.get("/ok").await;
+        first.assert_status(StatusCode::UNAUTHORIZED);
+
+        let second = server.get("/ok").await;
         second.assert_status(StatusCode::TOO_MANY_REQUESTS);
         let body: Value = second.json();
         assert_eq!(body["code"], json!("self_attestation.rate_limited"));

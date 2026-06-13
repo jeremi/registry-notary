@@ -1,4 +1,4 @@
-# Registry Notary SD-JWT VC Conformance Profile
+# Registry Notary SD-JWT VC conformance profile
 
 > **Page type:** Standards conformance · **Product:** Registry Notary · **Layer:** credential · **Audience:** integrator
 
@@ -121,7 +121,7 @@ Type Metadata convention, a consumer dereferences an HTTPS `vct` by inserting
   the candidate `vct` as `https://{host}/{vct_path}`, then matches it exactly
   against a configured credential configuration. The route uses a trailing-wildcard
   capture, so nested configured paths such as
-  `/.well-known/vct/credentials/dhis2/health-status/v1` are supported, not just two
+  `/.well-known/vct/credentials/dhis2/health-status/v1` are supported, not only two
   segments.
 - **Direct dereference.** The bare `GET /credentials/{vct_path}` route is also
   served for consumers that dereference the `vct` directly.
@@ -136,6 +136,37 @@ Type Metadata convention, a consumer dereferences an HTTPS `vct` by inserting
   disclosable, so claim metadata uses `sd: "always"`.
 - **CORS.** Browser-based wallets from configured self-attestation wallet origins
   receive CORS headers on the `/.well-known/vct/...` metadata surface.
+
+## Verification
+
+Registry Notary ships a verifier compatibility harness that exercises the
+`verify_sd_jwt_vc` path in `registry-notary-client` against a committed set of
+golden fixtures. The harness requires no secret material and no network access.
+
+Run the harness:
+
+```
+cargo test -p registry-notary-server --test sd_jwt_vc_verifier_compat
+```
+
+Or with `cargo-nextest`:
+
+```
+cargo nextest run -p registry-notary-server sd_jwt_vc_verifier_compat
+```
+
+Fixture files live under `tests/fixtures/sd_jwt_vc/`. To regenerate them using
+the server issuance path:
+
+```
+cargo run -p xtask -- gen-sd-jwt-vc-fixtures
+```
+
+The fixture set covers one valid credential, one valid holder-bound credential,
+and seven negative variants: unsupported algorithm, wrong `kid`, wrong `vct`,
+missing `cnf` when holder binding is required, malformed disclosure, expired
+credential, and holder proof mismatch. Each negative fixture is asserted against
+its exact error code from the verifier API.
 
 ## Explicit Non-Support
 

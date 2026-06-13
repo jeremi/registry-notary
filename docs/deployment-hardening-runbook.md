@@ -118,6 +118,11 @@ and timeout fields), see the
 Operational gates:
 
 - In-memory replay makes `/ready` return HTTP 503 with `status: degraded`.
+- Under a declared deployment profile, in-memory replay combined with a
+  high-risk mode (federation, OID4VCI pre-authorized code, holder proof,
+  wallet-facing traffic, or declared multi-instance) is gated by
+  `notary.replay.in_memory_high_risk`. See
+  [Deployment Profile and Gates](operator-config-reference.md#deployment-profile-and-gates).
 - The service fails readiness when Redis is unavailable.
 - Redis keys are scoped and hashed, but the Redis database is still operational
   security material.
@@ -219,21 +224,22 @@ Deployment checks:
   response shape and cardinality.
 - Keep `field_paths` and claim `fields` to the minimum data needed.
 
-When using OpenFn sidecars, isolate worker execution, pin adaptor versions, and
-avoid retrying non-idempotent jobs. The sidecar must be reachable only from
-Notary over localhost or a private pod network. Do not expose it publicly, put
-it behind an internet-facing ingress, or allow callers to invoke OpenFn worker
+When using source adapter sidecars, isolate worker execution when OpenFn is
+used, pin adaptor versions for OpenFn sources, and avoid retrying
+non-idempotent adapter calls. The sidecar must be reachable only from Notary
+over localhost or a private pod network. Do not expose it publicly, put it
+behind an internet-facing ingress, or allow callers to invoke OpenFn worker
 execution directly.
 
-Runbook gates for OpenFn sidecar source connections:
+Runbook gates for sidecar source connections:
 
-- Set `retry_on_5xx: false`. Notary does not retry OpenFn worker execution
+- Set `retry_on_5xx: false`. Notary does not retry sidecar adapter execution
   failures.
 - In governed deployments, set `expected_sidecar` on the source connection to
   fail closed on runtime identity or config-hash mismatch.
 
 For full sidecar config fields and examples, see the
-[OpenFn Sidecar Source Connections section of the configuration reference](operator-config-reference.md#openfn-sidecar-source-connections).
+[Source Adapter Sidecar Source Connections section of the configuration reference](operator-config-reference.md#source-adapter-sidecar-source-connections).
 
 ## Signing Keys
 

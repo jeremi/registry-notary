@@ -25,9 +25,9 @@ Before editing YAML, decide these items:
 | Multi-instance deployment | More than one Notary process serves traffic | `replay.storage: redis`, usually `credential_status.storage: redis` |
 | Credential suspension or revocation | Verifiers need a live status URL | `credential_status.enabled: true` |
 | Audit retention | Operators need traceability without raw personal data | `audit` |
-| OpenFn sidecar reads | A target system needs pinned adaptor execution or normalization outside Notary | `connector: openfn_sidecar`, `retry_on_5xx: false` |
-| OpenFn sidecar assurance | Notary must fail closed unless it is talking to the approved sidecar runtime | `source_connections.<id>.expected_sidecar` |
-| OpenFn batch matching | Batch evaluation should share one OpenFn sidecar read across compatible items | `bulk_mode: openfn_sidecar_batch`, binding `query_fields` |
+| Source adapter sidecar reads | A target system needs governed HTTP JSON mapping, pinned adaptor execution, or normalization outside Notary | `connector: openfn_sidecar`, `retry_on_5xx: false` |
+| Sidecar assurance | Notary must fail closed unless it is talking to the approved sidecar runtime | `source_connections.<id>.expected_sidecar` |
+| Sidecar batch matching | Batch evaluation should share one sidecar read across compatible items | `bulk_mode: openfn_sidecar_batch`, binding `query_fields` |
 
 Start with one narrow claim, one source connection, one signing key, and one
 credential profile. Add federation, wallet issuance, and batch evaluation after
@@ -39,6 +39,7 @@ the basic path passes `doctor`.
 | --- | --- | --- |
 | `server` | Bind address and process HTTP settings | No, defaults are present |
 | `auth` | Caller authentication and scope mapping | Yes |
+| `deployment` | Operator-declared deployment profile and gate waivers | No, an undeclared profile binds no gates |
 | `audit` | Redacted audit envelope sink and HMAC secret | Recommended for every deployable environment |
 | `config_trust` | Durable local state for governed config apply | No, only for signed governed config |
 | `evidence` | Claims, sources, rules, formats, signing keys, and credential profiles | Yes |
@@ -51,6 +52,83 @@ the basic path passes `doctor`.
 
 Unknown fields are rejected. That is intentional: a misspelled field should fail
 at config validation instead of becoming an accidental open policy.
+
+## Deployment Profile and Gates
+
+The `deployment` block lets an operator declare the assurance shape of a
+deployment. The profile is always declared by the operator and is never inferred
+from environment name, hostname, or network position.
+
+```yaml
+deployment:
+  profile: production      # local | hosted_lab | production | evidence_grade
+  multi_instance: true     # declares this instance shares a workload with others
+  waivers:
+    - finding: notary.source.private_network_escape
+      reason: "approved internal source for partner pilot, ticket OPS-123"
+      expires: 2026-09-30
+```
+
+| Field | Purpose |
+| --- | --- |
+| `profile` | The declared assurance shape. Absent means undeclared. |
+| `multi_instance` | Operator declaration that this instance runs active-active with peers, which makes shared, durable replay storage mandatory. |
+| `waivers` | Per-finding suppressions, each with a mandatory reason and expiry. |
+
+Profiles:
+
+| Profile | Use |
+| --- | --- |
+| `local` | Development, demos, tests, local pilots. Binds no gates. |
+| `hosted_lab` | Shared demos, partner evaluations, hosted validation. |
+| `production` | Real integrations handling sensitive or operational data. |
+| `evidence_grade` | Deployments where the evidence trail is itself part of the assurance claim. |
+
+An **undeclared** profile binds no gates and keeps current behavior. The posture
+report then carries a single `deployment.profile_undeclared` warning so the gap
+is visible without breaking the deployment. An **invalid** profile value fails
+startup, so a typo cannot silently disable enforcement.
+
+Each gate evaluates to one of four severities under the declared profile:
+
+| Severity | Effect |
+| --- | --- |
+| `startup_fail` | The process refuses to start. Never waivable. |
+| `readiness_fail` | The readiness endpoint reports not-ready; the process runs. |
+| `finding_error` | A posture finding, error class. |
+| `finding_warn` | A posture finding, warn class. |
+
+The gates bound for Registry Notary:
+
+| Finding id | Condition | hosted_lab | production | evidence_grade |
+| --- | --- | --- | --- | --- |
+| `notary.replay.in_memory_high_risk` | In-memory replay while federation, OID4VCI pre-authorized code, holder proof, wallet traffic, or `multi_instance` is declared | error | readiness_fail | startup_fail |
+| `notary.audit.sink_missing` | No durable, retained audit sink | error | startup_fail | startup_fail |
+| `notary.source.insecure_url` | Source connection over a plain `http://` URL with no localhost or private-network allowance | error | readiness_fail | startup_fail |
+| `notary.source.private_network_escape` | A source enables the private-network escape hatch | warn | error | error |
+| `notary.sidecar.expected_sidecar_missing` | An OpenFn source omits `expected_sidecar` | warn | error | readiness_fail |
+| `notary.admin.shared_exposure` | The admin surface shares the public listener | error | readiness_fail | startup_fail |
+| `notary.openapi.public` | OpenAPI is served without authentication | warn | error | error |
+| `notary.config.unsigned` | Local YAML config rather than signed governed config | warn | error | startup_fail |
+
+### Waivers
+
+A waiver names exactly one finding id, a free-text reason, and a mandatory
+`expires` date (`YYYY-MM-DD`). While active, a waiver changes a triggered
+finding's status to `waived` in posture instead of applying its severity effect.
+
+- `startup_fail` gates are never waivable. A waiver for one is rejected at config
+  load, because running at all would falsify the declared profile.
+- An expired waiver stops suppressing its finding and additionally raises
+  `deployment.waiver_expired` in posture, so lapsed approvals surface rather than
+  silently persisting.
+- Waiver reasons appear in the restricted-tier posture for review. Never put a
+  secret in a reason.
+
+Active waivers and gate findings appear in the admin posture document under the
+`deployment` object, and the eight-field audit assurance vocabulary appears under
+the top-level `audit` object. See `docs/security-assurance.md` for the assurance
+vocabulary.
 
 ## Secret Handling
 
@@ -329,8 +407,7 @@ and credential status mutation, require `registry_notary:admin`.
 `auth.mode: oidc` is for citizen and wallet flows. When OIDC is selected,
 `auth.api_keys` and `auth.bearer_tokens` must be empty. Configure:
 
-OIDC field names follow the shared Registry service runtime configuration
-conventions maintained in `registry-internal/principles/configuration-and-artifact-design-principles.md`.
+OIDC field names follow the shared Registry service runtime configuration conventions.
 Removed pre-convention names are rejected before deserialization with an error
 naming the replacement field.
 
@@ -402,13 +479,20 @@ For production, leave `allow_insecure_localhost` and
 accepts the private network source. Local demos may use them for loopback or
 Docker Compose style setups.
 
-### OpenFn Sidecar Source Connections
+### Source Adapter Sidecar Source Connections
 
-Use `connector: openfn_sidecar` when a target system needs OpenFn adaptor
-execution, target credential handling, or output normalization outside Notary.
-The source connection must use static sidecar bearer auth through `token_env`.
-Do not configure target-service credentials in Notary; keep them in the sidecar
-environment or secret store.
+Use `connector: openfn_sidecar` when a target system needs governed HTTP JSON
+mapping, OpenFn adaptor execution, target credential handling, or output
+normalization outside Notary. The connector value remains `openfn_sidecar` for
+compatibility; the sidecar source chooses `engine: http_json` or
+`engine: openfn` in its own signed manifest. The source connection must use
+static sidecar bearer auth through `token_env`. Do not configure target-service
+credentials in Notary; keep them in the sidecar environment or secret store.
+Configure performance and target-protection controls in the sidecar manifest:
+per-source `max_in_flight`, optional request rate and burst, `Retry-After`
+backoff handling, `http_json` sequential/parallel/native batch mode, and any
+explicit TTL-bound result cache. Treat cache settings as evidence freshness
+policy, not only performance tuning.
 
 For high-assurance deployments, pin the sidecar runtime that Notary is allowed
 to use with `expected_sidecar`. Notary reads the private sidecar assurance
@@ -416,7 +500,7 @@ endpoint before source reads and fails closed when the product identity,
 environment, stream, `config_hash`, expression-hash verification, runtime
 verification, or smoke-check state does not match the pin.
 
-Single-read OpenFn sidecar example:
+Single-read sidecar example:
 
 ```yaml
 evidence:
@@ -469,7 +553,7 @@ evidence:
         field: birth_date
 ```
 
-OpenFn sidecar batch matching example with `query_fields`:
+Sidecar batch matching example with `query_fields`:
 
 ```yaml
 evidence:
@@ -558,19 +642,19 @@ evidence:
         source: crvs
 ```
 
-For OpenFn sidecar connections:
+For sidecar connections:
 
-- Set `retry_on_5xx: false`. Notary does not retry OpenFn worker execution
+- Set `retry_on_5xx: false`. Notary does not retry sidecar adapter execution
   failures.
 - Use `bulk_mode: openfn_sidecar_batch` only after sidecar contract tests cover
   per-item not found, exact match, ambiguous match, missing response item,
-  duplicate response item id, worker timeout, worker failure, and output
+  duplicate response item id, adapter timeout, adapter failure, and output
   projection.
-- In governed environments, set `expected_sidecar` on every OpenFn sidecar
+- In governed environments, set `expected_sidecar` on every sidecar
   connection. Local demos may omit it only when the assurance boundary is not
   part of the test.
 
-See [deployment-hardening-runbook.md](deployment-hardening-runbook.md) for
+See the [deployment hardening runbook](https://github.com/jeremi/registry-notary/blob/f182385a5065873aac030c41d9fe020704afc4e2/docs/deployment-hardening-runbook.md) for
 network isolation requirements, responsibility boundaries between Notary and
 the sidecar, and deployment security expectations.
 
@@ -658,6 +742,10 @@ source_bindings:
         - benefit_eligibility_check
       allowed_relationships:
         - self
+        - guardian
+      relationship_purpose_scopes:
+        guardian:
+          - benefit_eligibility_check
       sufficient_target_inputs:
         - [target.attributes.given_name, target.attributes.family_name, target.attributes.birthdate]
       allowed_target_inputs:
@@ -677,6 +765,7 @@ Fields:
 | `requester_type` | If set, the request `requester.type` must equal this value | unenforced |
 | `allowed_purposes` | Purposes this binding may be used for; empty means no purpose restriction here | empty |
 | `allowed_relationships` | Relationship types this binding accepts | empty |
+| `relationship_purpose_scopes` | Per-relationship purpose allow-list; a scoped relationship used for any other purpose is rejected with granular code `relationship.purpose_not_allowed` | empty |
 | `sufficient_target_inputs` | OR-of-AND groups of target paths; the request must satisfy at least one full group | empty |
 | `allowed_target_inputs` | Allow-list of target paths the binding may read; empty means unrestricted | empty |
 | `allowed_requester_inputs` | Allow-list of requester paths the binding may read; empty means unrestricted | empty |
@@ -694,6 +783,12 @@ Notes:
   A request that supplies a path outside the allow-list is rejected, so a binding
   cannot over-collect by accident. Leave them empty only for identifier-only
   bindings that need no attribute minimization.
+- `relationship_purpose_scopes` narrows named relationships to specific
+  purposes after the flat `allowed_purposes` and `allowed_relationships` checks.
+  Each scoped relationship must also appear in `allowed_relationships`.
+  Relationships with no entry in the map keep the unscoped behavior. When
+  `collapse_matching_errors` is on, callers see `evidence.not_available` and the
+  granular code is retained for audit.
 - `collapse_matching_errors` defaults to on. Turn it off only in a controlled
   environment where exposing not-found versus ambiguous versus rejected to the
   caller is acceptable, because those differences can be used as an existence
@@ -702,7 +797,7 @@ Notes:
   on every successful match and does not measure how strong an individual match was.
 - Config validation rejects blank values: `policy_id`, `method`, `target_type`, and
   `requester_type` must be non-empty when present, and the purpose, relationship,
-  and input-path lists must not contain blank entries.
+  relationship purpose scope, and input-path lists must not contain blank entries.
 
 ## Credential Profiles
 
@@ -795,7 +890,7 @@ The config keys unique to this page are: `subject_binding.token_claim`,
 `credential_profiles`, `scope_policy`, `required_scopes`,
 `allowed_wallet_origins`, and `rate_limits`.
 
-See [`self-attestation-operator-guide.md`](self-attestation-operator-guide.md)
+See the [self-attestation operator guide](https://github.com/jeremi/registry-notary/blob/f182385a5065873aac030c41d9fe020704afc4e2/docs/self-attestation-operator-guide.md)
 for the full config blocks, identity-provider requirements, scope policy,
 wallet origin controls, rate-limit fields, and rollout checklist.
 
@@ -882,7 +977,7 @@ and the credential profile it references:
 - `format` is `dc+sd-jwt`.
 - `vct` matches the credential profile `vct`.
 
-See [`oid4vci-wallet-interop.md`](oid4vci-wallet-interop.md) for the wallet
+See the [OID4VCI wallet interop guide](https://github.com/jeremi/registry-notary/blob/f182385a5065873aac030c41d9fe020704afc4e2/docs/oid4vci-wallet-interop.md) for the wallet
 flow sequence, authenticated pre-authorized-code flow details, nonce policy,
 Type Metadata serving, compatibility checklist, and troubleshooting.
 

@@ -10,6 +10,7 @@ use std::time::Duration;
 use registry_platform_authcommon::CredentialFingerprintRef;
 use registry_platform_config::{DeprecatedConfigField, RegistryTrustRoot};
 use registry_platform_crypto::validate_did_web_https_issuer_binding;
+use registry_platform_crypto::PublicJwk;
 pub use registry_platform_crypto::{
     KeyProviderKind as SigningKeyProviderConfig, KeyStatus as SigningKeyStatus,
 };
@@ -19,6 +20,7 @@ use registry_platform_oid4vci::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::deployment::DeploymentConfig;
 use crate::model::{
     DisclosureProfile, FORMAT_SD_JWT_VC, SD_JWT_VC_HOLDER_BINDING_METHOD, SD_JWT_VC_SIGNING_ALG,
 };
@@ -57,6 +59,8 @@ pub struct StandaloneRegistryNotaryConfig {
     pub oid4vci: Oid4vciConfig,
     #[serde(default, skip_serializing_if = "federation_config_is_default")]
     pub federation: FederationConfig,
+    #[serde(default, skip_serializing_if = "DeploymentConfig::is_default")]
+    pub deployment: DeploymentConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -532,7 +536,81 @@ impl StandaloneRegistryNotaryConfig {
         self.federation.validate(&self.evidence)?;
         self.validate_replay_cross_block()?;
         self.validate_signing_key_alg_usage()?;
+        self.deployment.validate().map_err(|error| {
+            EvidenceConfigError::InvalidDeploymentConfig {
+                reason: error.to_string(),
+            }
+        })?;
         Ok(())
+    }
+
+    /// Snapshot the configuration facts the deployment gate engine reads.
+    ///
+    /// Pure projection of the loaded config. Building it here keeps gate
+    /// predicates free of config-shape knowledge.
+    pub fn gate_input(&self) -> crate::deployment::GateInput {
+        crate::deployment::GateInput {
+            replay_in_memory: self.replay.storage != REPLAY_STORAGE_REDIS,
+            federation_enabled: self.federation.enabled,
+            oid4vci_preauth_enabled: self.oid4vci.enabled
+                && self.oid4vci.pre_authorized_code.enabled,
+            holder_proof_required: self.evidence.credential_profiles.values().any(|profile| {
+                profile.holder_binding.proof_of_possession.as_deref() == Some("required")
+            }),
+            wallet_facing: self.self_attestation.enabled,
+            multi_instance: self.deployment.multi_instance,
+            audit_sink_class_durable: audit_sink_is_durable(&self.audit),
+            source_insecure_url: self
+                .evidence
+                .source_connections
+                .values()
+                .any(source_connection_uses_insecure_url),
+            source_private_network_escape: self
+                .evidence
+                .source_connections
+                .values()
+                .any(|connection| connection.allow_insecure_private_network),
+            openfn_source_without_expected_sidecar: self.evidence.source_connections.values().any(
+                |connection| {
+                    connection.bulk_mode == BulkMode::OpenFnSidecarBatch
+                        && connection.expected_sidecar.is_none()
+                },
+            ),
+            admin_shared_exposure: self.server.admin_listener.mode
+                == RegistryNotaryAdminListenerMode::SharedWithPublic,
+            openapi_public: !self.server.openapi_requires_auth,
+            config_unsigned: self.config_trust.is_none(),
+        }
+    }
+
+    /// Signing-key ids whose resolved public material must not be shared, per
+    /// issue #173. These are the separated EdDSA signing roles: every credential
+    /// profile signing key, the access-token signing key (when enabled), and the
+    /// federation signing key (when enabled). The same separation boundary is
+    /// documented in `validate_signing_key_alg_usage`, which treats those three
+    /// sites as distinct EdDSA roles. The eSignet pre-authorized-code RP client
+    /// key is intentionally excluded: it is a separate, relaxed role that is
+    /// allowed to reuse the credential issuer's key material.
+    pub fn reuse_scoped_signing_key_ids(&self) -> HashSet<&str> {
+        let mut scoped: HashSet<&str> = self
+            .evidence
+            .credential_profiles
+            .values()
+            .map(|profile| profile.signing_key.as_str())
+            .collect();
+        if self.auth.access_token_signing.enabled {
+            let access_token_key = self.auth.access_token_signing.signing_key_id.as_str();
+            if !access_token_key.is_empty() {
+                scoped.insert(access_token_key);
+            }
+        }
+        if self.federation.enabled {
+            let federation_key = self.federation.signing.signing_key.as_str();
+            if !federation_key.is_empty() {
+                scoped.insert(federation_key);
+            }
+        }
+        scoped
     }
 
     /// Confine non-EdDSA (RS256) signing keys to the eSignet pre-authorized-code
@@ -3678,6 +3756,27 @@ fn default_audit_sink() -> String {
     "stdout".to_string()
 }
 
+/// A durable audit sink retains the evidence trail beyond process stdout.
+///
+/// `stdout` and `none` are not durable, retained sinks for a production-shaped
+/// deployment; `file`, `jsonl`, and `syslog` write to a retained destination.
+fn audit_sink_is_durable(config: &EvidenceAuditConfig) -> bool {
+    matches!(config.sink.as_str(), "file" | "jsonl" | "syslog")
+}
+
+/// A source connection fetches over an insecure URL when its base URL is plain
+/// `http://` and no localhost or private-network escape hatch is enabled.
+///
+/// The escape hatches (`allow_insecure_localhost`, `allow_insecure_private_network`)
+/// are reported by their own gate, so this predicate covers only the case of an
+/// insecure URL on the strict outbound policy.
+fn source_connection_uses_insecure_url(connection: &SourceConnectionConfig) -> bool {
+    let base = connection.base_url.trim();
+    base.starts_with("http://")
+        && !connection.allow_insecure_localhost
+        && !connection.allow_insecure_private_network
+}
+
 pub fn deprecated_config_fields() -> Vec<DeprecatedConfigField> {
     vec![
         DeprecatedConfigField::renamed("auth.oidc.jwks_uri", "auth.oidc.jwks_url"),
@@ -3784,6 +3883,8 @@ pub enum EvidenceConfigError {
     InvalidServerConfig { reason: String },
     #[error("invalid config_trust config: {reason}")]
     InvalidConfigTrustConfig { reason: String },
+    #[error("invalid deployment config: {reason}")]
+    InvalidDeploymentConfig { reason: String },
     #[error("source_connection '{connection}': invalid source_auth config: {reason}")]
     InvalidSourceAuthConfig { connection: String, reason: String },
     #[error("source_connection '{connection}': invalid expected_sidecar config: {reason}")]
@@ -3998,6 +4099,65 @@ impl EvidenceConfig {
         }
         Ok(())
     }
+
+    /// Validate resolved signing-capable key material after runtime providers
+    /// have loaded their public JWKs. Static config can compare ids and kids,
+    /// but only the resolved JWKs reveal whether different active entries reuse
+    /// the same key material under different ids or kids.
+    ///
+    /// The reuse comparison is confined to the separated EdDSA signing roles
+    /// issue #173 names: the access-token signing key and every credential
+    /// profile signing key, plus the federation signing key (the documented
+    /// separation boundary in `validate_signing_key_alg_usage` treats all three
+    /// as distinct EdDSA roles). `reuse_scoped_key_ids` carries exactly those
+    /// role keys. The eSignet pre-authorized-code RP client key is a separate,
+    /// relaxed role that is deliberately allowed to share material with the
+    /// credential issuer key, so callers must leave it out of
+    /// `reuse_scoped_key_ids`; resolved JWKs for keys outside the set are not
+    /// compared.
+    pub fn validate_resolved_signing_key_material<'a, I>(
+        &self,
+        resolved_public_jwks: I,
+        reuse_scoped_key_ids: &HashSet<&str>,
+    ) -> Result<(), EvidenceConfigError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a PublicJwk)>,
+    {
+        let mut thumbprints_by_key_id = BTreeMap::new();
+        for (key_id, public_jwk) in resolved_public_jwks {
+            let Some(key) = self.signing_keys.get(key_id) else {
+                return invalid_signing_key(
+                    key_id,
+                    "resolved public JWK does not match a configured signing key",
+                );
+            };
+            if !key.status.may_sign() {
+                continue;
+            }
+            // Only the separated signing roles (#173) are compared against one
+            // another; keys outside that set (notably the eSignet RP client
+            // key) are allowed to reuse credential material by design.
+            if !reuse_scoped_key_ids.contains(key_id) {
+                continue;
+            }
+            let thumbprint =
+                public_jwk
+                    .jkt()
+                    .map_err(|_| EvidenceConfigError::InvalidSigningKeyConfig {
+                        key: key_id.to_string(),
+                        reason: "resolved public JWK could not be thumbprinted".to_string(),
+                    })?;
+            if let Some(previous_key_id) =
+                thumbprints_by_key_id.insert(thumbprint, key_id.to_string())
+            {
+                return invalid_signing_key(
+                    key_id,
+                    format!("reuses public key material with signing key '{previous_key_id}'"),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_source_matching_config(
@@ -4049,6 +4209,32 @@ fn validate_source_matching_config(
             claim,
             binding,
             "allowed_relationships must not contain blanks",
+        );
+    }
+    if matching
+        .relationship_purpose_scopes
+        .iter()
+        .any(|(relationship, purposes)| {
+            relationship.trim().is_empty()
+                || purposes.is_empty()
+                || purposes.iter().any(|purpose| purpose.trim().is_empty())
+        })
+    {
+        return invalid_matching_config(
+            claim,
+            binding,
+            "relationship_purpose_scopes must contain non-empty relationships and purposes",
+        );
+    }
+    if matching
+        .relationship_purpose_scopes
+        .keys()
+        .any(|relationship| !matching.allowed_relationships.contains(relationship))
+    {
+        return invalid_matching_config(
+            claim,
+            binding,
+            "relationship_purpose_scopes entries must also appear in allowed_relationships",
         );
     }
     if matching
@@ -4215,6 +4401,10 @@ pub struct SourceMatchingConfig {
     pub allowed_purposes: Vec<String>,
     #[serde(default)]
     pub allowed_relationships: Vec<String>,
+    /// Relationship-specific purpose allow-lists. Empty means relationships
+    /// accepted by `allowed_relationships` are not purpose-scoped.
+    #[serde(default)]
+    pub relationship_purpose_scopes: BTreeMap<String, Vec<String>>,
     /// OR-of-AND groups of request paths. Example:
     /// `[["target.attributes.given_name", "target.attributes.family_name"]]`.
     #[serde(default)]
@@ -4244,6 +4434,7 @@ impl Default for SourceMatchingConfig {
             requester_type: None,
             allowed_purposes: Vec::new(),
             allowed_relationships: Vec::new(),
+            relationship_purpose_scopes: BTreeMap::new(),
             sufficient_target_inputs: Vec::new(),
             allowed_target_inputs: Vec::new(),
             allowed_requester_inputs: Vec::new(),
@@ -5096,6 +5287,266 @@ auth:
 "#,
         )
         .expect("minimal config is valid YAML")
+    }
+
+    #[test]
+    fn gate_input_defaults_are_low_risk_for_minimal_config() {
+        let config = minimal_config();
+        let input = config.gate_input();
+        // A minimal config uses in-memory replay and stdout audit by default.
+        assert!(input.replay_in_memory);
+        assert!(!input.audit_sink_class_durable);
+        // No high-risk modes are declared.
+        assert!(!input.high_risk_replay_mode());
+        // No source connections, so source gates are clear.
+        assert!(!input.source_insecure_url);
+        assert!(!input.source_private_network_escape);
+        assert!(!input.openfn_source_without_expected_sidecar);
+        // Local YAML config without config_trust is unsigned.
+        assert!(input.config_unsigned);
+        // Admin listener is disabled by default, so no shared exposure.
+        assert!(!input.admin_shared_exposure);
+        // OpenAPI requires auth by default.
+        assert!(!input.openapi_public);
+    }
+
+    #[test]
+    fn gate_input_reports_federation_as_high_risk() {
+        let mut config = minimal_config();
+        config.federation.enabled = true;
+        assert!(config.gate_input().high_risk_replay_mode());
+    }
+
+    #[test]
+    fn gate_input_reports_durable_audit_sink() {
+        let mut config = minimal_config();
+        config.audit.sink = "file".to_string();
+        assert!(config.gate_input().audit_sink_class_durable);
+    }
+
+    #[test]
+    fn gate_input_reports_insecure_source_url() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "src".to_string(),
+            serde_norway::from_str(
+                r#"
+base_url: http://upstream.example
+token_env: SRC_TOKEN
+"#,
+            )
+            .expect("source connection parses"),
+        );
+        assert!(config.gate_input().source_insecure_url);
+    }
+
+    #[test]
+    fn gate_input_localhost_escape_is_not_an_insecure_url() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "src".to_string(),
+            serde_norway::from_str(
+                r#"
+base_url: http://127.0.0.1:9000
+allow_insecure_localhost: true
+token_env: SRC_TOKEN
+"#,
+            )
+            .expect("source connection parses"),
+        );
+        let input = config.gate_input();
+        assert!(!input.source_insecure_url);
+    }
+
+    #[test]
+    fn gate_input_reports_source_private_network_escape() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "src".to_string(),
+            serde_norway::from_str(
+                r#"
+base_url: http://10.0.0.1:9000
+allow_insecure_private_network: true
+token_env: SRC_TOKEN
+"#,
+            )
+            .expect("source connection parses"),
+        );
+        assert!(config.gate_input().source_private_network_escape);
+    }
+
+    #[test]
+    fn gate_input_clears_source_private_network_escape_without_flag() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "src".to_string(),
+            serde_norway::from_str(
+                r#"
+base_url: https://upstream.example
+token_env: SRC_TOKEN
+"#,
+            )
+            .expect("source connection parses"),
+        );
+        assert!(!config.gate_input().source_private_network_escape);
+    }
+
+    #[test]
+    fn gate_input_reports_openfn_source_without_expected_sidecar() {
+        let mut config = minimal_config();
+        // Insert a source connection with bulk_mode = openfn_sidecar_batch and
+        // no expected_sidecar. We call gate_input() directly without validate()
+        // because this projection test only checks the GateInput field.
+        let mut conn: SourceConnectionConfig = serde_norway::from_str(
+            r#"
+base_url: https://openfn.example
+token_env: SRC_TOKEN
+"#,
+        )
+        .expect("source connection parses");
+        conn.bulk_mode = BulkMode::OpenFnSidecarBatch;
+        // expected_sidecar remains None by default.
+        config
+            .evidence
+            .source_connections
+            .insert("openfn-src".to_string(), conn);
+        assert!(config.gate_input().openfn_source_without_expected_sidecar);
+    }
+
+    #[test]
+    fn gate_input_clears_openfn_source_with_expected_sidecar() {
+        let mut config = minimal_config();
+        let mut conn: SourceConnectionConfig = serde_norway::from_str(
+            r#"
+base_url: https://openfn.example
+token_env: SRC_TOKEN
+expected_sidecar:
+  product: openfn-notary-bridge
+  instance_id: bridge-1
+  environment: lab
+  stream_id: stream-a
+  config_hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+"#,
+        )
+        .expect("source connection with expected_sidecar parses");
+        conn.bulk_mode = BulkMode::OpenFnSidecarBatch;
+        config
+            .evidence
+            .source_connections
+            .insert("openfn-src".to_string(), conn);
+        assert!(!config.gate_input().openfn_source_without_expected_sidecar);
+    }
+
+    #[test]
+    fn gate_input_reports_admin_shared_exposure() {
+        let mut config = minimal_config();
+        config.server.admin_listener.mode = RegistryNotaryAdminListenerMode::SharedWithPublic;
+        assert!(config.gate_input().admin_shared_exposure);
+    }
+
+    #[test]
+    fn gate_input_clears_admin_shared_exposure_when_listener_disabled() {
+        let config = minimal_config();
+        // Default admin listener mode is Disabled; shared exposure must be false.
+        assert!(!config.gate_input().admin_shared_exposure);
+    }
+
+    #[test]
+    fn gate_input_reports_openapi_public() {
+        let mut config = minimal_config();
+        config.server.openapi_requires_auth = false;
+        assert!(config.gate_input().openapi_public);
+    }
+
+    #[test]
+    fn gate_input_clears_openapi_public_when_auth_required() {
+        let config = minimal_config();
+        // Default requires auth; openapi_public must be false.
+        assert!(!config.gate_input().openapi_public);
+    }
+
+    #[test]
+    fn gate_input_clears_config_unsigned_when_trust_configured() {
+        let mut config = minimal_config();
+        // Setting config_trust to Some makes config_unsigned false. We set the
+        // admin listener to dedicated because validate() requires it; this test
+        // only calls gate_input(), which is pure projection and does not validate.
+        config.server.admin_listener.mode = RegistryNotaryAdminListenerMode::Dedicated;
+        config.config_trust = Some(ConfigTrustConfig {
+            antirollback_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-antirollback.json",
+            ),
+            local_approval_state_path: PathBuf::from(
+                "/var/lib/registry-notary/config-local-approvals.json",
+            ),
+            break_glass_rate_limit: default_break_glass_rate_limit(),
+            accepted_roots: Vec::new(),
+            remote_tuf_repositories: Vec::new(),
+        });
+        assert!(!config.gate_input().config_unsigned);
+    }
+
+    #[test]
+    fn gate_input_reports_config_unsigned_without_trust() {
+        let config = minimal_config();
+        // Minimal config has no config_trust block; must project as unsigned.
+        assert!(config.gate_input().config_unsigned);
+    }
+
+    #[test]
+    fn gate_input_reports_insecure_source_url_non_triggering_with_https() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "src".to_string(),
+            serde_norway::from_str(
+                r#"
+base_url: https://upstream.example
+token_env: SRC_TOKEN
+"#,
+            )
+            .expect("source connection parses"),
+        );
+        assert!(!config.gate_input().source_insecure_url);
+    }
+
+    #[test]
+    fn deployment_block_round_trips_through_yaml() {
+        let mut config = minimal_config();
+        config.deployment = serde_norway::from_str(
+            r#"
+profile: production
+waivers:
+  - finding: notary.openapi.public
+    reason: synthetic partner integration waiver
+    expires: 2099-09-30
+"#,
+        )
+        .expect("deployment block parses");
+        assert_eq!(
+            config.deployment.profile,
+            Some(crate::deployment::DeploymentProfile::Production)
+        );
+        config
+            .validate()
+            .expect("production config with waivable waiver validates");
+    }
+
+    #[test]
+    fn invalid_profile_value_fails_config_load() {
+        let result: Result<StandaloneRegistryNotaryConfig, _> = serde_norway::from_str(
+            r#"
+evidence:
+  enabled: true
+auth:
+  mode: api_key
+deployment:
+  profile: prod
+"#,
+        );
+        assert!(
+            result.is_err(),
+            "an invalid profile string must fail to load"
+        );
     }
 
     fn use_dedicated_admin_listener(config: &mut StandaloneRegistryNotaryConfig) {
@@ -8063,6 +8514,97 @@ allowed_claims: ["", "   "]
     }
 
     #[test]
+    fn blank_relationship_purpose_scope_entries_are_rejected() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "crvs".to_string(),
+            SourceConnectionConfig {
+                base_url: "https://upstream.example".to_string(),
+                allow_insecure_localhost: false,
+                allow_insecure_private_network: false,
+                token_env: "SRC_TOKEN".to_string(),
+                source_auth: None,
+                expected_sidecar: None,
+                dci: DciSourceConnectionConfig::default(),
+                max_in_flight: 8,
+                retry_on_5xx: true,
+                bulk_mode: BulkMode::None,
+                bulk_mode_lookup_unique: false,
+                bulk_timeout_max_ms: 30_000,
+            },
+        );
+        let mut claim = minimal_claim("date-of-birth");
+        let binding = rda_binding("crvs", "one");
+        claim.source_bindings.insert("src".to_string(), binding);
+        claim
+            .source_bindings
+            .get_mut("src")
+            .expect("source binding exists")
+            .matching
+            .relationship_purpose_scopes
+            .insert("guardian".to_string(), vec![" ".to_string()]);
+        config.evidence.claims = vec![claim];
+
+        let err = config
+            .validate()
+            .expect_err("blank relationship purpose scope must fail validation");
+
+        match err {
+            EvidenceConfigError::InvalidMatchingConfig { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    "relationship_purpose_scopes must contain non-empty relationships and purposes",
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn relationship_purpose_scope_must_reference_allowed_relationship() {
+        let mut config = minimal_config();
+        config.evidence.source_connections.insert(
+            "crvs".to_string(),
+            SourceConnectionConfig {
+                base_url: "https://upstream.example".to_string(),
+                allow_insecure_localhost: false,
+                allow_insecure_private_network: false,
+                token_env: "SRC_TOKEN".to_string(),
+                source_auth: None,
+                expected_sidecar: None,
+                dci: DciSourceConnectionConfig::default(),
+                max_in_flight: 8,
+                retry_on_5xx: true,
+                bulk_mode: BulkMode::None,
+                bulk_mode_lookup_unique: false,
+                bulk_timeout_max_ms: 30_000,
+            },
+        );
+        let mut claim = minimal_claim("date-of-birth");
+        let mut binding = rda_binding("crvs", "one");
+        binding
+            .matching
+            .relationship_purpose_scopes
+            .insert("guardian".to_string(), vec!["benefits".to_string()]);
+        claim.source_bindings.insert("src".to_string(), binding);
+        config.evidence.claims = vec![claim];
+
+        let err = config
+            .validate()
+            .expect_err("scope relationship must be in the flat allow-list");
+
+        match err {
+            EvidenceConfigError::InvalidMatchingConfig { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    "relationship_purpose_scopes entries must also appear in allowed_relationships",
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
     fn self_attestation_is_disabled_by_default() {
         let config = minimal_config();
         assert!(!config.self_attestation.enabled);
@@ -8861,6 +9403,20 @@ status: active
         key
     }
 
+    fn test_public_jwk(kid: &str, x: &str) -> PublicJwk {
+        PublicJwk::parse(
+            &serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": x,
+                "alg": "EdDSA",
+                "kid": kid,
+            })
+            .to_string(),
+        )
+        .expect("test public JWK parses")
+    }
+
     /// A pre-auth-enabled oid4vci config with a dedicated access-token signing
     /// key, distinct from the credential-signing key.
     fn valid_pre_auth_config() -> StandaloneRegistryNotaryConfig {
@@ -8980,6 +9536,111 @@ access_token_ttl_seconds: 300
         config.auth.access_token_signing.signing_key_id = "issuer-key".to_string();
         let reason = expect_access_token_signing_error(&config);
         assert!(reason.contains("distinct from credential profile"));
+    }
+
+    #[test]
+    fn resolved_signing_key_material_must_not_be_reused_under_distinct_kids() {
+        let config = valid_pre_auth_config();
+        let credential_public_jwk = test_public_jwk(
+            "did:web:issuer.example#key-1",
+            "1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc",
+        );
+        let access_token_public_jwk = test_public_jwk(
+            "did:web:issuer.example#access-token-key",
+            "1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc",
+        );
+
+        let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+        let err = config
+            .evidence
+            .validate_resolved_signing_key_material(
+                [
+                    ("issuer-key", &credential_public_jwk),
+                    ("access-token-key", &access_token_public_jwk),
+                ],
+                &reuse_scoped_key_ids,
+            )
+            .expect_err("same public key material under different kids must fail");
+
+        match err {
+            EvidenceConfigError::InvalidSigningKeyConfig { key, reason } => {
+                assert_eq!(key, "access-token-key");
+                assert!(reason.contains("reuses public key material"));
+                assert!(reason.contains("issuer-key"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn resolved_signing_key_material_accepts_distinct_public_keys() {
+        let config = valid_pre_auth_config();
+        let credential_public_jwk = test_public_jwk(
+            "did:web:issuer.example#key-1",
+            "1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc",
+        );
+        let access_token_public_jwk = test_public_jwk(
+            "did:web:issuer.example#access-token-key",
+            "pv4e_hXHBLN27rcs6VDFV1ED0TiU8M3xy9vsuWFEsec",
+        );
+
+        let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+        config
+            .evidence
+            .validate_resolved_signing_key_material(
+                [
+                    ("issuer-key", &credential_public_jwk),
+                    ("access-token-key", &access_token_public_jwk),
+                ],
+                &reuse_scoped_key_ids,
+            )
+            .expect("distinct public key material is valid");
+    }
+
+    #[test]
+    fn resolved_signing_key_material_allows_esignet_rp_key_to_reuse_credential_material() {
+        // Issue #173 confines reuse detection to the separated EdDSA roles. The
+        // eSignet pre-authorized-code RP client key is a relaxed role that is
+        // deliberately allowed to share material with the credential issuer key,
+        // so it must not appear in the reuse-scoped set and must not trip the
+        // detector even when its resolved material matches a credential key.
+        let mut config = valid_pre_auth_config();
+        let mut esignet_key = second_signing_key();
+        esignet_key.kid = "did:web:rp.example#esignet-rp-key".to_string();
+        config
+            .evidence
+            .signing_keys
+            .insert("esignet-rp-key".to_string(), esignet_key);
+        config
+            .oid4vci
+            .pre_authorized_code
+            .esignet
+            .client_signing_key_id = "esignet-rp-key".to_string();
+        let credential_public_jwk = test_public_jwk(
+            "did:web:issuer.example#key-1",
+            "1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc",
+        );
+        let esignet_public_jwk = test_public_jwk(
+            "did:web:rp.example#esignet-rp-key",
+            "1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc",
+        );
+
+        let reuse_scoped_key_ids = config.reuse_scoped_signing_key_ids();
+        assert!(
+            !reuse_scoped_key_ids.contains("esignet-rp-key"),
+            "the eSignet RP client key must be excluded from reuse-scoped roles"
+        );
+
+        config
+            .evidence
+            .validate_resolved_signing_key_material(
+                [
+                    ("issuer-key", &credential_public_jwk),
+                    ("esignet-rp-key", &esignet_public_jwk),
+                ],
+                &reuse_scoped_key_ids,
+            )
+            .expect("eSignet RP key may reuse credential key material");
     }
 
     #[test]

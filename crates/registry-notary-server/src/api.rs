@@ -870,8 +870,9 @@ async fn admin_config_apply(
         .with_break_glass_rate_limit(break_glass_rate_limit);
     let antirollback_key = antirollback_key(&config_governance, &candidate.stream_id);
     let local_approval = governed_apply.local_approval().cloned();
-    if let Err(error) = antirollback_store.accept(
-        &antirollback_key,
+    if let Err(error) = accept_antirollback_blocking(
+        antirollback_store.clone(),
+        antirollback_key.clone(),
         AntiRollbackProposal {
             sequence: candidate.sequence,
             previous_config_hash: candidate.previous_config_hash.clone(),
@@ -882,10 +883,17 @@ async fn admin_config_apply(
             local_approval: local_approval.clone(),
             local_approval_rate_limit: local_approval.as_ref().map(|approval| approval.rate_limit),
         },
-    ) {
+    )
+    .await
+    {
         let (result, status) = antirollback_apply_failure(&error);
         let detail = if matches!(error, AntiRollbackStoreError::PreviousConfigHashMismatch) {
-            match antirollback_store.load(&antirollback_key) {
+            match load_antirollback_record_blocking(
+                antirollback_store.clone(),
+                antirollback_key.clone(),
+            )
+            .await
+            {
                 Ok(record) => Some(previous_config_hash_mismatch_detail(
                     &record.last_config_hash,
                     &NormalizedPreviousConfigHash {
@@ -986,6 +994,33 @@ async fn admin_config_apply(
         .with_break_glass_request(&request)
         .with_local_approval(local_approval.as_ref()),
     )
+}
+
+async fn accept_antirollback_blocking(
+    store: FileAntiRollbackStore,
+    key: AntiRollbackKey,
+    proposal: AntiRollbackProposal,
+) -> Result<(), AntiRollbackStoreError> {
+    tokio::task::spawn_blocking(move || store.accept(&key, proposal).map(|_| ()))
+        .await
+        .unwrap_or_else(|error| {
+            Err(AntiRollbackStoreError::Io(format!(
+                "anti-rollback accept task failed: {error}"
+            )))
+        })
+}
+
+async fn load_antirollback_record_blocking(
+    store: FileAntiRollbackStore,
+    key: AntiRollbackKey,
+) -> Result<registry_platform_ops::AntiRollbackRecord, AntiRollbackStoreError> {
+    tokio::task::spawn_blocking(move || store.load(&key))
+        .await
+        .unwrap_or_else(|error| {
+            Err(AntiRollbackStoreError::Io(format!(
+                "anti-rollback load task failed: {error}"
+            )))
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -1432,7 +1467,7 @@ fn classify_credential_issuer_rotation(
     }
     old_referenced_keys_are_safe_for_rotation(&current, candidate)?;
     let (issuers, signer_readiness) =
-        crate::standalone::credential_issuer_runtime_from_config(&candidate.evidence)
+        crate::standalone::credential_issuer_runtime_from_config(candidate)
             .map_err(|_| CredentialIssuerRotationError::Readiness)?;
     let previous_preauth = preauth_runtime(state);
     let preauth = crate::standalone::preauth_runtime_from_config_preserving_stores(
@@ -2235,6 +2270,14 @@ async fn ready(state: Option<Extension<Arc<RegistryNotaryApiState>>>) -> Respons
                     failed += 1;
                 }
             }
+            if state.deployment_gates.is_bound() {
+                total += 1;
+                if state.deployment_gates.has_readiness_failure() {
+                    failed += 1;
+                } else {
+                    ok += 1;
+                }
+            }
         }
         (total, ok, failed)
     };
@@ -2250,6 +2293,14 @@ async fn ready(state: Option<Extension<Arc<RegistryNotaryApiState>>>) -> Respons
                     ok += 1;
                 } else {
                     failed += 1;
+                }
+            }
+            if state.deployment_gates.is_bound() {
+                total += 1;
+                if state.deployment_gates.has_readiness_failure() {
+                    failed += 1;
+                } else {
+                    ok += 1;
                 }
             }
         }
@@ -2723,6 +2774,7 @@ pub struct RegistryNotaryApiState {
     runtime: Arc<RwLock<Arc<ApiRuntimeSnapshot>>>,
     auth_state: Option<Arc<AuthAuditState>>,
     pub(crate) posture: Option<Arc<PostureContext>>,
+    pub(crate) deployment_gates: Arc<crate::standalone::DeploymentGateState>,
     config_apply_posture: Arc<RwLock<ConfigApplyPosture>>,
     #[cfg(feature = "registry-notary-cel")]
     pub(crate) cel_worker: Option<Arc<CelWorker>>,
@@ -2950,6 +3002,7 @@ impl RegistryNotaryApiState {
             runtime: Arc::new(RwLock::new(runtime)),
             auth_state: None,
             posture: None,
+            deployment_gates: Arc::new(crate::standalone::DeploymentGateState::default()),
             config_apply_posture: Arc::new(RwLock::new(ConfigApplyPosture::default())),
             #[cfg(feature = "registry-notary-cel")]
             cel_worker: None,
@@ -2985,6 +3038,14 @@ impl RegistryNotaryApiState {
 
     pub(crate) fn with_posture_context(mut self, posture: PostureContext) -> Self {
         self.posture = Some(Arc::new(posture));
+        self
+    }
+
+    pub(crate) fn with_deployment_gates(
+        mut self,
+        gates: crate::standalone::DeploymentGateState,
+    ) -> Self {
+        self.deployment_gates = Arc::new(gates);
         self
     }
 
@@ -7439,6 +7500,7 @@ pub(crate) fn evidence_status(error: &EvidenceError) -> StatusCode {
         | EvidenceError::RequesterMatchingPolicyRejected
         | EvidenceError::TargetMatchingPolicyRejected
         | EvidenceError::RelationshipNotEstablished
+        | EvidenceError::RelationshipPurposeNotAllowed
         | EvidenceError::RelationshipPolicyRejected
         | EvidenceError::ScopeDenied { .. }
         | EvidenceError::SelfAttestationDenied { .. }
@@ -7487,6 +7549,7 @@ pub(crate) fn evidence_title(error: &EvidenceError) -> &'static str {
         EvidenceError::RelationshipMatchAmbiguous => "Relationship match ambiguous",
         EvidenceError::RelationshipAttributesInsufficient => "Relationship attributes insufficient",
         EvidenceError::RelationshipPolicyRejected => "Relationship policy rejected",
+        EvidenceError::RelationshipPurposeNotAllowed => "Relationship purpose not allowed",
         EvidenceError::PurposeNotAllowed => "Purpose not allowed",
         EvidenceError::ProfileUnsupported => "Profile unsupported",
         EvidenceError::EvidenceNotAvailable
@@ -7562,6 +7625,9 @@ pub(crate) fn evidence_detail(error: &EvidenceError) -> &'static str {
         }
         EvidenceError::RelationshipPolicyRejected => {
             "the requester-target relationship is not allowed"
+        }
+        EvidenceError::RelationshipPurposeNotAllowed => {
+            "the requester-target relationship is not allowed for the declared purpose"
         }
         EvidenceError::PurposeNotAllowed => "the declared purpose is not allowed",
         EvidenceError::ProfileUnsupported => "the requested profile is not supported",
@@ -8043,6 +8109,98 @@ mod tests {
             assert_eq!(result, ApplyReportResult::RejectedRollback);
             assert_eq!(status, StatusCode::CONFLICT);
         }
+    }
+
+    #[tokio::test]
+    async fn antirollback_accept_wrapper_advances_state() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = FileAntiRollbackStore::new(tmp.path().join("antirollback.json"));
+        let key = antirollback_wrapper_test_key();
+        store
+            .initialize(registry_platform_ops::AntiRollbackRecord {
+                key: key.clone(),
+                last_sequence: 1,
+                last_config_hash: test_hash('a'),
+                root_version: Some(1),
+                break_glass: registry_platform_ops::BreakGlassState::default(),
+                local_approvals: registry_platform_ops::LocalApprovalState::default(),
+            })
+            .expect("antirollback state initializes");
+
+        accept_antirollback_blocking(
+            store.clone(),
+            key.clone(),
+            AntiRollbackProposal {
+                sequence: 2,
+                previous_config_hash: Some(test_hash('a')),
+                config_hash: test_hash('b'),
+                root_version: Some(2),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
+            },
+        )
+        .await
+        .expect("accept succeeds");
+
+        let record = load_antirollback_record_blocking(store, key)
+            .await
+            .expect("record loads");
+        assert_eq!(record.last_sequence, 2);
+        assert_eq!(record.last_config_hash, test_hash('b'));
+    }
+
+    #[tokio::test]
+    async fn antirollback_accept_wrapper_preserves_store_errors() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = FileAntiRollbackStore::new(tmp.path().join("antirollback.json"));
+        let key = antirollback_wrapper_test_key();
+        store
+            .initialize(registry_platform_ops::AntiRollbackRecord {
+                key: key.clone(),
+                last_sequence: 2,
+                last_config_hash: test_hash('b'),
+                root_version: Some(2),
+                break_glass: registry_platform_ops::BreakGlassState::default(),
+                local_approvals: registry_platform_ops::LocalApprovalState::default(),
+            })
+            .expect("antirollback state initializes");
+
+        let error = accept_antirollback_blocking(
+            store,
+            key,
+            AntiRollbackProposal {
+                sequence: 1,
+                previous_config_hash: Some(test_hash('a')),
+                config_hash: test_hash('c'),
+                root_version: Some(2),
+                break_glass: None,
+                break_glass_rate_limit: None,
+                local_approval: None,
+                local_approval_rate_limit: None,
+            },
+        )
+        .await
+        .expect_err("rollback is rejected");
+
+        assert_eq!(error, AntiRollbackStoreError::NonMonotonicSequence);
+        let (result, status) = antirollback_apply_failure(&error);
+        assert_eq!(result, ApplyReportResult::RejectedRollback);
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    fn antirollback_wrapper_test_key() -> AntiRollbackKey {
+        AntiRollbackKey {
+            product: "registry-notary".to_string(),
+            instance_id: "test-instance".to_string(),
+            environment: "test".to_string(),
+            stream_id: "config".to_string(),
+        }
+    }
+
+    fn test_hash(ch: char) -> String {
+        format!("sha256:{}", ch.to_string().repeat(64))
     }
 
     fn classifier_config() -> StandaloneRegistryNotaryConfig {

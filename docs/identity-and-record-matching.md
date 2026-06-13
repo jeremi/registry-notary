@@ -125,14 +125,13 @@ Matching is policy-driven and source-side. The source connector or sidecar
 performs the comparison; Notary core enforces a policy gate before the read and
 minimizes what it forwards.
 
-For OpenFn sidecar sources, the same boundary applies to both single reads and
-batch matching. Notary decides which request paths may be used, collapses public
+For sidecar sources, the same boundary applies to both single reads and batch
+matching. Notary decides which request paths may be used, collapses public
 matching errors when configured, audits the decision, and applies disclosure.
 The sidecar receives only the minimized source query terms, projected fields,
 purpose, correlation metadata, source id, dataset, entity, and sidecar-owned
-configuration needed to execute the adaptor workflow. It does not receive the
-full target, requester, relationship, assurance, claim config, or disclosure
-config.
+configuration needed to execute the adapter. It does not receive the full target,
+requester, relationship, assurance, claim config, or disclosure config.
 
 Two controls run before any source query leaves Notary:
 
@@ -262,12 +261,18 @@ Matching is designed to disclose as little as possible:
 A claim can also match the `requester` and a `relationship` when the decision
 depends on who is asking and how they relate to the target, such as a guardian
 acting for a dependent. The binding's policy controls which relationship types are
-allowed and which request paths each may carry, and the requester and relationship
-produce their own outcomes.
+allowed, which purposes a scoped relationship may carry, and which request paths
+each may use. The requester and relationship produce their own outcomes.
+
+Use `relationship_purpose_scopes` when a relationship is valid only for a subset
+of the binding's allowed purposes. A request with a valid relationship type but a
+purpose outside that relationship's scope fails with
+granular code `relationship.purpose_not_allowed` before Notary reads the source.
+With default error collapsing, callers see `evidence.not_available` and operators
+can inspect the granular audit code.
 
 The `profile` and `on_behalf_of` fields are accepted by the request model but
-are not evaluated. Binding delegation scope to purpose and minimum-assurance
-gating for target inputs are not implemented.
+are not evaluated. Minimum-assurance gating for target inputs is not implemented.
 
 ## Operator checklist
 
@@ -329,6 +334,7 @@ Notary conformance statement says so.
 | `target.match_ambiguous` | The lookup matched more than one record | Add attributes to the lookup so it lands on one record, or tighten the source query |
 | `target.attributes_insufficient` | The request did not satisfy any required input group | Supply one full group from the binding's `sufficient_target_inputs`; check for an extra attribute the allow-list rejects |
 | `target.matching_policy_rejected` | The request shape is outside the binding's policy | Check entity type, purpose, relationship, and the allowed input paths against the binding |
+| `relationship.purpose_not_allowed` | The relationship is valid but not for the declared purpose; this is an audit code when matching errors are collapsed | Check `relationship_purpose_scopes` for the relationship and purpose |
 | `target.not_found` | The source returned no record for the target | Confirm the lookup value and that the record exists in the source |
 
 ## Related
