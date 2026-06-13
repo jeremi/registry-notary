@@ -432,13 +432,10 @@ fn verify_holder_binding(
         let sd_hash_input = key_binding_sd_hash_input.ok_or(VerificationError::HolderBinding {
             code: "holder_binding.proof_invalid",
         })?;
-        let challenge = key_binding_challenge.ok_or(VerificationError::HolderBinding {
-            code: "holder_binding.challenge_required",
-        })?;
         verify_key_binding_jwt(
             key_binding_jwt,
             &sd_hash_input,
-            challenge,
+            key_binding_challenge,
             &holder_jwk,
             now,
             skew,
@@ -450,7 +447,7 @@ fn verify_holder_binding(
 fn verify_key_binding_jwt(
     compact: &str,
     sd_hash_input: &str,
-    challenge: &KeyBindingChallenge,
+    challenge: Option<&KeyBindingChallenge>,
     holder_jwk: &PublicJwk,
     now: i64,
     skew: i64,
@@ -524,6 +521,9 @@ fn verify_key_binding_jwt(
             code: "holder_binding.proof_invalid",
         });
     }
+    let challenge = challenge.ok_or(VerificationError::HolderBinding {
+        code: "holder_binding.challenge_required",
+    })?;
     if !audience_matches(&payload, &challenge.expected_audience)
         || payload.get("nonce").and_then(Value::as_str) != Some(challenge.expected_nonce.as_str())
     {

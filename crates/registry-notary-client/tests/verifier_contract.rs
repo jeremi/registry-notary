@@ -128,6 +128,21 @@ async fn verify_sd_jwt_vc_rejects_bad_key_binding_jwt() {
 }
 
 #[tokio::test]
+async fn verify_sd_jwt_vc_rejects_bad_key_binding_jwt_before_missing_challenge() {
+    let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
+    let presentation = format!("{compact}{}", unsigned_compact_jws());
+
+    let error = verifier::verify_sd_jwt_vc(
+        &presentation,
+        &jwks(ISSUER_JWK),
+        &options().holder_binding(HolderBindingPolicy::Required),
+    )
+    .expect_err("bad key binding jwt is rejected before challenge validation");
+
+    assert_code(error, "holder_binding.proof_invalid");
+}
+
+#[tokio::test]
 async fn verify_sd_jwt_vc_rejects_key_binding_jwt_without_verifier_challenge() {
     let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
     let presentation = format!(
