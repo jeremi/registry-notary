@@ -21,11 +21,14 @@ use registry_notary_client::{
 use registry_platform_crypto::{did_jwk_from_public_jwk, sign, PrivateJwk};
 use registry_platform_sdjwt::{Disclosure, HolderConfirmation, SdJwtIssuanceInput, SdJwtIssuer};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 const ISSUER: &str = "did:web:issuer.test";
 const VCT: &str = "https://vct.example/test";
 const NOW: i64 = 1_700_000_010;
+const VERIFIER_AUDIENCE: &str = "https://verifier.example/session";
+const VERIFIER_NONCE: &str = "challenge-nonce-1";
 const ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA","kid":"did:web:issuer.test#key-1"}"#;
 const ROTATED_ISSUER_JWK: &str = r#"{"crv":"Ed25519","d":"f4QIxnAyRWzhuBOmNRgvBTE56mWePdsPL0mvCtl8Gys","x":"pv4e_hXHBLN27rcs6VDFV1ED0TiU8M3xy9vsuWFEsec","kty":"OKP","alg":"EdDSA","kid":"did:web:issuer.test#key-2"}"#;
 const HOLDER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"2oPoxdKuO7Kpd-3JLfNW_4xwpFxItbS-fxe03ZybYEw","x":"1aj_rLJsGFgw-5v925EMmeZj5JqP44xegafEKfZbdxc","alg":"EdDSA","kid":"holder-key-1"}"#;
@@ -90,12 +93,17 @@ async fn verify_sd_jwt_vc_rejects_duplicate_presented_disclosure() {
 #[tokio::test]
 async fn verify_sd_jwt_vc_separates_key_binding_jwt_from_disclosures() {
     let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
-    let presentation = format!("{compact}{}", signed_key_binding_jwt());
+    let presentation = format!(
+        "{compact}{}",
+        signed_key_binding_jwt(&compact, VERIFIER_AUDIENCE, VERIFIER_NONCE, NOW + 30)
+    );
 
     let verified = verifier::verify_sd_jwt_vc(
         &presentation,
         &jwks(ISSUER_JWK),
-        &options().holder_binding(HolderBindingPolicy::Required),
+        &options()
+            .holder_binding(HolderBindingPolicy::Required)
+            .key_binding_challenge(VERIFIER_AUDIENCE, VERIFIER_NONCE),
     )
     .expect("key binding jwt is not treated as a disclosure");
 
@@ -110,9 +118,77 @@ async fn verify_sd_jwt_vc_rejects_bad_key_binding_jwt() {
     let error = verifier::verify_sd_jwt_vc(
         &presentation,
         &jwks(ISSUER_JWK),
-        &options().holder_binding(HolderBindingPolicy::Required),
+        &options()
+            .holder_binding(HolderBindingPolicy::Required)
+            .key_binding_challenge(VERIFIER_AUDIENCE, VERIFIER_NONCE),
     )
     .expect_err("bad key binding jwt is rejected");
+
+    assert_code(error, "holder_binding.proof_invalid");
+}
+
+#[tokio::test]
+async fn verify_sd_jwt_vc_rejects_key_binding_jwt_without_verifier_challenge() {
+    let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
+    let presentation = format!(
+        "{compact}{}",
+        signed_key_binding_jwt(&compact, VERIFIER_AUDIENCE, VERIFIER_NONCE, NOW + 30)
+    );
+
+    let error = verifier::verify_sd_jwt_vc(
+        &presentation,
+        &jwks(ISSUER_JWK),
+        &options().holder_binding(HolderBindingPolicy::Required),
+    )
+    .expect_err("key binding jwt requires verifier challenge");
+
+    assert_code(error, "holder_binding.challenge_required");
+}
+
+#[tokio::test]
+async fn verify_sd_jwt_vc_rejects_key_binding_jwt_for_other_presentation() {
+    let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
+    let other_compact = issue_sd_jwt_with_claims(
+        ISSUER_JWK,
+        ISSUER,
+        NOW,
+        NOW + 50,
+        Some(&holder_did()),
+        &["claim-a", "claim-b"],
+    )
+    .await;
+    let replayed_key_binding =
+        signed_key_binding_jwt(&other_compact, VERIFIER_AUDIENCE, VERIFIER_NONCE, NOW + 30);
+    let presentation = format!("{compact}{replayed_key_binding}");
+
+    let error = verifier::verify_sd_jwt_vc(
+        &presentation,
+        &jwks(ISSUER_JWK),
+        &options()
+            .holder_binding(HolderBindingPolicy::Required)
+            .key_binding_challenge(VERIFIER_AUDIENCE, VERIFIER_NONCE),
+    )
+    .expect_err("key binding jwt is bound to the presented sd-jwt");
+
+    assert_code(error, "holder_binding.proof_invalid");
+}
+
+#[tokio::test]
+async fn verify_sd_jwt_vc_rejects_key_binding_jwt_for_other_challenge() {
+    let compact = issue_sd_jwt(ISSUER_JWK, ISSUER, NOW, NOW + 50, Some(&holder_did())).await;
+    let presentation = format!(
+        "{compact}{}",
+        signed_key_binding_jwt(&compact, "https://other.example", "other-nonce", NOW + 30)
+    );
+
+    let error = verifier::verify_sd_jwt_vc(
+        &presentation,
+        &jwks(ISSUER_JWK),
+        &options()
+            .holder_binding(HolderBindingPolicy::Required)
+            .key_binding_challenge(VERIFIER_AUDIENCE, VERIFIER_NONCE),
+    )
+    .expect_err("key binding jwt is bound to verifier challenge");
 
     assert_code(error, "holder_binding.proof_invalid");
 }
@@ -357,10 +433,20 @@ fn unsigned_compact_jws() -> String {
     format!("{header}.{payload}.signature")
 }
 
-fn signed_key_binding_jwt() -> String {
+fn signed_key_binding_jwt(sd_hash_input: &str, audience: &str, nonce: &str, exp: i64) -> String {
     let holder = PrivateJwk::parse(HOLDER_JWK).expect("holder jwk parses");
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"kb+jwt","kid":"holder-key-1"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(br#"{"iat":1700000010}"#);
+    let sd_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(sd_hash_input.as_bytes()));
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iat": NOW,
+            "exp": exp,
+            "aud": audience,
+            "nonce": nonce,
+            "sd_hash": sd_hash,
+        }))
+        .expect("key binding payload serializes"),
+    );
     let signing_input = format!("{header}.{payload}");
     let signature = sign(signing_input.as_bytes(), &holder).expect("holder proof signs");
     format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature))

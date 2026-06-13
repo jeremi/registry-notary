@@ -27,6 +27,8 @@ pub struct VerifyOptions {
     pub clock_skew: Duration,
     /// Holder-binding policy for the embedded `cnf` confirmation.
     pub holder_binding: HolderBindingPolicy,
+    /// Expected verifier challenge for validating an SD-JWT key-binding JWT.
+    pub key_binding_challenge: Option<KeyBindingChallenge>,
     /// Test hook for deterministic time checks. Production callers should leave
     /// this unset.
     pub now: Option<OffsetDateTime>,
@@ -41,6 +43,7 @@ impl VerifyOptions {
             expected_vct: None,
             clock_skew: Duration::from_secs(60),
             holder_binding: HolderBindingPolicy::NotRequired,
+            key_binding_challenge: None,
             now: None,
         }
     }
@@ -73,10 +76,32 @@ impl VerifyOptions {
     }
 
     #[must_use]
+    pub fn key_binding_challenge(
+        mut self,
+        expected_audience: impl Into<String>,
+        expected_nonce: impl Into<String>,
+    ) -> Self {
+        self.key_binding_challenge = Some(KeyBindingChallenge {
+            expected_audience: expected_audience.into(),
+            expected_nonce: expected_nonce.into(),
+        });
+        self
+    }
+
+    #[must_use]
     pub fn now(mut self, now: OffsetDateTime) -> Self {
         self.now = Some(now);
         self
     }
+}
+
+/// Verifier-controlled SD-JWT key-binding JWT challenge values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBindingChallenge {
+    /// Expected `aud` claim identifying this verifier.
+    pub expected_audience: String,
+    /// Expected verifier-provided `nonce` claim for this presentation.
+    pub expected_nonce: String,
 }
 
 /// Holder-binding expectation for the credential confirmation.
@@ -287,6 +312,8 @@ fn verify_claims(
         payload,
         &options.holder_binding,
         parsed.key_binding_jwt,
+        parsed.key_binding_sd_hash_input(),
+        options.key_binding_challenge.as_ref(),
         now,
         skew,
     )?;
@@ -365,6 +392,8 @@ fn verify_holder_binding(
     payload: &Value,
     policy: &HolderBindingPolicy,
     key_binding_jwt: Option<&str>,
+    key_binding_sd_hash_input: Option<String>,
+    key_binding_challenge: Option<&KeyBindingChallenge>,
     now: i64,
     skew: i64,
 ) -> Result<Option<String>, VerificationError> {
@@ -400,13 +429,28 @@ fn verify_holder_binding(
         }
     }
     if let Some(key_binding_jwt) = key_binding_jwt {
-        verify_key_binding_jwt(key_binding_jwt, &holder_jwk, now, skew)?;
+        let sd_hash_input = key_binding_sd_hash_input.ok_or(VerificationError::HolderBinding {
+            code: "holder_binding.proof_invalid",
+        })?;
+        let challenge = key_binding_challenge.ok_or(VerificationError::HolderBinding {
+            code: "holder_binding.challenge_required",
+        })?;
+        verify_key_binding_jwt(
+            key_binding_jwt,
+            &sd_hash_input,
+            challenge,
+            &holder_jwk,
+            now,
+            skew,
+        )?;
     }
     Ok(actual_kid)
 }
 
 fn verify_key_binding_jwt(
     compact: &str,
+    sd_hash_input: &str,
+    challenge: &KeyBindingChallenge,
     holder_jwk: &PublicJwk,
     now: i64,
     skew: i64,
@@ -468,7 +512,42 @@ fn verify_key_binding_jwt(
             code: "holder_binding.proof_invalid",
         });
     }
+    let exp =
+        payload
+            .get("exp")
+            .and_then(Value::as_i64)
+            .ok_or(VerificationError::HolderBinding {
+                code: "holder_binding.proof_invalid",
+            })?;
+    if exp <= now.saturating_sub(skew) {
+        return Err(VerificationError::HolderBinding {
+            code: "holder_binding.proof_invalid",
+        });
+    }
+    if !audience_matches(&payload, &challenge.expected_audience)
+        || payload.get("nonce").and_then(Value::as_str) != Some(challenge.expected_nonce.as_str())
+    {
+        return Err(VerificationError::HolderBinding {
+            code: "holder_binding.proof_invalid",
+        });
+    }
+    let expected_sd_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(sd_hash_input.as_bytes()));
+    if payload.get("sd_hash").and_then(Value::as_str) != Some(expected_sd_hash.as_str()) {
+        return Err(VerificationError::HolderBinding {
+            code: "holder_binding.proof_invalid",
+        });
+    }
     Ok(())
+}
+
+fn audience_matches(payload: &Value, expected_audience: &str) -> bool {
+    match payload.get("aud") {
+        Some(Value::String(audience)) => audience == expected_audience,
+        Some(Value::Array(audiences)) => audiences
+            .iter()
+            .any(|audience| audience.as_str() == Some(expected_audience)),
+        _ => false,
+    }
 }
 
 fn reject_untrusted_header_references(header: &Value) -> Result<(), VerificationError> {
@@ -613,6 +692,19 @@ impl<'a> ParsedSdJwt<'a> {
 
     fn signing_input(&self) -> String {
         format!("{}.{}", self.header_b64, self.payload_b64)
+    }
+
+    fn key_binding_sd_hash_input(&self) -> Option<String> {
+        self.key_binding_jwt?;
+        let mut input = format!(
+            "{}.{}.{}~",
+            self.header_b64, self.payload_b64, self.signature_b64
+        );
+        for disclosure in &self.disclosures {
+            input.push_str(disclosure);
+            input.push('~');
+        }
+        Some(input)
     }
 }
 

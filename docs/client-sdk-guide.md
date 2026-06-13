@@ -364,7 +364,8 @@ use registry_notary_client::{HolderBindingPolicy, VerifyOptions};
 
 let options = VerifyOptions::new("did:web:notary.example")
     .expected_vct("https://credentials.example/vct/person-is-alive")
-    .holder_binding(HolderBindingPolicy::Required);
+    .holder_binding(HolderBindingPolicy::Required)
+    .key_binding_challenge("https://verifier.example/session", "fresh-verifier-nonce");
 
 let verified = client
     .verify_credential_response(&credential.body, options)
@@ -374,18 +375,22 @@ let verified = client
 The verifier resolves the JWS `kid` only from trusted issuer JWKS, reuses the
 client's short JWKS TTL cache, and forces one refresh on `key.unknown`. It does
 not loop indefinitely. `VerifyOptions` lets callers set expected issuer,
-accepted algorithms, expected `vct`, clock skew, and holder-binding policy.
-Selective-disclosure presentations may include a subset of disclosures; each
-presented disclosure must hash to a digest in the credential. When a
-presentation includes a key-binding JWT, the verifier separates it from
-disclosures and verifies its holder proof signature against the credential
-`cnf.jwk`.
+accepted algorithms, expected `vct`, clock skew, holder-binding policy, and
+verifier-controlled key-binding challenge values. Selective-disclosure
+presentations may include a subset of disclosures; each presented disclosure
+must hash to a digest in the credential. When a presentation includes a
+key-binding JWT, callers must set `key_binding_challenge` for the current
+verifier session; the verifier separates the proof from disclosures, verifies
+its holder signature against the credential `cnf.jwk`, and validates `sd_hash`,
+`aud`, `nonce`, `exp`, and future `iat` so the proof is bound to this
+presentation and challenge.
 
 Verifier errors are redacted and safe for policy mapping by code. Stable codes
 include `signature.invalid`, `key.unknown`, `algorithm.disallowed`,
 `claim.issuer_mismatch`, `claim.vct_mismatch`, `claim.time_invalid`,
-`disclosure.digest_mismatch`, `holder_binding.required`, and
-`holder_binding.kid_mismatch`, and `holder_binding.proof_invalid`.
+`disclosure.digest_mismatch`, `holder_binding.required`,
+`holder_binding.challenge_required`, `holder_binding.kid_mismatch`, and
+`holder_binding.proof_invalid`.
 
 Python and Node do not expose verifier wrappers in this first phase. Callers in
 those runtimes should use the Rust verifier through their application boundary

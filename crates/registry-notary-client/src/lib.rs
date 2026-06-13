@@ -86,4 +86,6 @@ pub use responses::{
     ListClaimsResponse, NotaryResponse,
 };
 #[cfg(feature = "verifier")]
-pub use verifier::{HolderBindingPolicy, VerificationError, VerifiedCredential, VerifyOptions};
+pub use verifier::{
+    HolderBindingPolicy, KeyBindingChallenge, VerificationError, VerifiedCredential, VerifyOptions,
+};

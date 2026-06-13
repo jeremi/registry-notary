@@ -80,7 +80,8 @@ use registry_notary_client::{HolderBindingPolicy, VerifyOptions};
 
 let options = VerifyOptions::new("did:web:notary.example")
     .expected_vct("https://credentials.example/vct/person-is-alive")
-    .holder_binding(HolderBindingPolicy::Required);
+    .holder_binding(HolderBindingPolicy::Required)
+    .key_binding_challenge("https://verifier.example/session", "fresh-verifier-nonce");
 
 let verified = client
     .verify_credential_response(&credential.body, options)
@@ -92,11 +93,15 @@ uses the normal JWKS TTL cache, forces one refresh on `key.unknown`, and then
 stops. It checks the allowed algorithm list, header type, issuer, `vct`,
 `exp`/`nbf`/`iat` with bounded skew, disclosure digests, and required
 holder-binding confirmation. When an SD-JWT VC presentation includes a
-key-binding JWT, the verifier separates it from disclosures and verifies its
-holder proof signature against `cnf.jwk`. Verifier errors expose stable
+key-binding JWT, callers must provide `key_binding_challenge` values for the
+current verifier session; the verifier separates the proof from disclosures,
+checks its holder signature against `cnf.jwk`, and validates `sd_hash`, `aud`,
+`nonce`, `exp`, and future `iat` so the proof is bound to this presentation and
+challenge. Verifier errors expose stable
 redacted codes such as `signature.invalid`, `key.unknown`, `algorithm.disallowed`,
 `claim.issuer_mismatch`, `claim.time_invalid`,
-`disclosure.digest_mismatch`, and `holder_binding.required`.
+`disclosure.digest_mismatch`, `holder_binding.required`, and
+`holder_binding.challenge_required`.
 
 Python and Node wrappers do not expose verifier wrappers in this first phase;
 use the Rust verifier or perform verification in application-specific wallet
