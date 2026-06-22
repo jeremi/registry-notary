@@ -4034,6 +4034,7 @@ impl Authenticator {
                         allowed_algorithms,
                         oidc.allowed_token_types.clone(),
                     )
+                    .with_access_token_typ_required(!oidc.allowed_token_types.is_empty())
                     .with_scope_claim(oidc.scope_claim.clone())
                     .with_scope_separator(scope_separator)
                     .with_scope_map(
@@ -6298,6 +6299,7 @@ async fn read_external_dci_http_many(
     let message_id = Ulid::new().to_string();
     let mut request_body = json!({
         "header": {
+            "version": connection.dci.version,
             "message_id": message_id,
             "message_ts": timestamp,
             "action": "search",
@@ -6777,6 +6779,7 @@ fn dci_search_request_body_for_values(
     let search_criteria = dci_search_criteria_for_values(dci, binding, lookup_values, 2)?;
     let mut body = json!({
         "header": {
+            "version": dci.version,
             "message_id": message_id,
             "message_ts": timestamp,
             "action": "search",
@@ -10683,6 +10686,22 @@ config_trust:
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn dci_search_request_body_includes_spdci_version() {
+        let binding = test_binding("civil_registry", "civil_person");
+        let dci = DciSourceConnectionConfig::default();
+
+        let body =
+            dci_search_request_body(&dci, &binding, &json!("NID-2001")).expect("body builds");
+
+        assert_eq!(body["header"]["version"], json!("1.0.0"));
+        assert_eq!(body["header"]["sender_id"], json!("registry-notary"));
+        assert_eq!(
+            body["message"]["search_request"][0]["search_criteria"]["query_type"],
+            json!("idtype-value")
         );
     }
 

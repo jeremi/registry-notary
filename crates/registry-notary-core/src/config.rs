@@ -5491,6 +5491,8 @@ const fn default_concurrency_bindings() -> usize {
 pub struct DciSourceConnectionConfig {
     #[serde(default = "default_dci_search_path")]
     pub search_path: String,
+    #[serde(default = "default_dci_version")]
+    pub version: String,
     #[serde(default = "default_dci_sender_id")]
     pub sender_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5524,6 +5526,7 @@ impl Default for DciSourceConnectionConfig {
     fn default() -> Self {
         Self {
             search_path: default_dci_search_path(),
+            version: default_dci_version(),
             sender_id: default_dci_sender_id(),
             receiver_id: None,
             query_type: default_dci_query_type(),
@@ -5541,6 +5544,10 @@ impl Default for DciSourceConnectionConfig {
 
 fn default_dci_search_path() -> String {
     "/registry/sync/search".to_string()
+}
+
+fn default_dci_version() -> String {
+    "1.0.0".to_string()
 }
 
 fn default_dci_sender_id() -> String {

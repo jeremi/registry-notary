@@ -10961,6 +10961,7 @@ async fn standalone_server_reads_dci_source_and_evaluates_cel_claim() {
         .expect("observed request lock")
         .clone()
         .expect("DCI request captured");
+    assert_eq!(observed["header"]["version"], "1.0.0");
     assert_eq!(observed["header"]["action"], "search");
     assert_eq!(observed["header"]["receiver_id"], "upstream-registry");
     assert_eq!(observed["signature"], "");
