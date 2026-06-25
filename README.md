@@ -1,6 +1,18 @@
 # Registry Notary
 
-> **Experimental:** This codebase is under active development. Its APIs are evolving quickly and may be unstable.
+**Moved:** Active development has moved to the public monorepo:
+[`registrystack/registry-stack`](https://github.com/registrystack/registry-stack).
+
+This repository is retained for pre-monorepo history and release tags. File new
+issues and pull requests in the monorepo.
+
+Current source at monorepo ref `ab5a1d46df8715539f15d398804611e8ca9c52d9`:
+
+- [`crates/`](https://github.com/registrystack/registry-stack/tree/ab5a1d46df8715539f15d398804611e8ca9c52d9/crates) for `registry-notary-*` crates
+- [`products/notary/`](https://github.com/registrystack/registry-stack/tree/ab5a1d46df8715539f15d398804611e8ca9c52d9/products/notary)
+
+**Legacy status:** Pre-monorepo releases were experimental pre-1.0 evaluation
+builds. Current API evolution happens in the monorepo.
 
 Release label: pre-1.0 technical release for evaluation and integration pilots.
 
